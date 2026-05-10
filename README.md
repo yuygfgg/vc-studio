@@ -44,6 +44,8 @@ The **Parameters** tab controls shared realtime and offline settings:
 - `mel-overlap-sec` blends future mel context across adjacent chunks.
 - `delayed-commit-sec` waits for extra source context before emitting a chunk.
 - `audio-declick-ms` and `audio-blend-ms` are optional waveform boundary tools.
+- `Silero VAD gate` optionally detects non-speech source chunks and mutes the
+  matching output spans without changing tokenizer or model input.
 - `flow-context` selects streaming causal attention or full attention inside the
   current window.
 - `hift-mode` selects windowed vocoding or stateful vocoder caches.
@@ -74,6 +76,12 @@ prosody at the cost of real output latency.
 `audio-declick-ms` and `audio-blend-ms` default to `0.0`. They are optional
 waveform-domain diagnostics and are not required for the stateful HiFT boundary
 alignment path.
+The Silero VAD gate defaults to off. Enable it when microphone noise or room
+tone is being converted into voice-like artifacts during pauses. The VAD
+threshold and timing fields control Silero's speech decision; higher thresholds
+are stricter, while lower minimum speech durations catch shorter utterances.
+The source audio still flows through tokenization and inference unchanged; VAD
+only decides which emitted output spans are faded to silence.
 Flow sampling uses source-global deterministic noise and source-global DiT
 positions, so the same absolute source frames receive stable diffusion noise and
 RoPE positions across adjacent windows. `flow-context=streaming` keeps the DiT

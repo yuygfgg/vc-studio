@@ -53,6 +53,11 @@ def main() -> None:
     parser.add_argument("--delayed-commit-sec", type=float, default=0.0, help="Prefill delayed commit")
     parser.add_argument("--audio-declick-ms", type=float, default=0.0, help="Prefill waveform de-click")
     parser.add_argument("--audio-blend-ms", type=float, default=0.0, help="Prefill waveform crossfade")
+    parser.add_argument("--enable-vad", action="store_true", help="Prefill Silero VAD noise gate on")
+    parser.add_argument("--vad-threshold", type=float, default=0.5, help="Prefill Silero VAD speech threshold")
+    parser.add_argument("--vad-min-speech-ms", type=float, default=100.0, help="Prefill Silero VAD minimum speech duration")
+    parser.add_argument("--vad-min-silence-ms", type=float, default=100.0, help="Prefill Silero VAD minimum silence duration")
+    parser.add_argument("--vad-speech-pad-ms", type=float, default=30.0, help="Prefill Silero VAD speech padding")
     parser.add_argument("--flow-context", default="streaming", choices=["streaming", "window-full"], help="Prefill flow context")
     parser.add_argument("--hift-mode", default="stateful", choices=["window", "stateful"], help="Prefill HiFT mode")
     parser.add_argument("--disable-prompt-kv-cache", action="store_true", help="Prefill prompt cache off")
@@ -100,6 +105,11 @@ class StreamSettings:
     delayed_commit_sec: float
     audio_declick_ms: float
     audio_blend_ms: float
+    vad_enabled: bool
+    vad_threshold: float
+    vad_min_speech_ms: float
+    vad_min_silence_ms: float
+    vad_speech_pad_ms: float
     flow_context: str
     hift_mode: str
     disable_prompt_kv_cache: bool
@@ -216,6 +226,11 @@ def stream_context_log_lines(
         f"delayed_commit_tokens={context.delayed_commit_tokens} delayed_commit_seconds={context.delayed_commit_tokens / 25.0:.3f}",
         f"audio_declick_samples={context.audio_declick_samples} audio_declick_ms={context.audio_declick_samples / model.sample_rate * 1000:.3f}",
         f"max_audio_blend_samples={context.max_audio_blend_samples} audio_blend_ms={context.max_audio_blend_samples / model.sample_rate * 1000:.3f}",
+        f"vad_enabled={settings.vad_enabled}",
+        f"vad_threshold={settings.vad_threshold:.3f}",
+        f"vad_min_speech_ms={settings.vad_min_speech_ms:.1f}",
+        f"vad_min_silence_ms={settings.vad_min_silence_ms:.1f}",
+        f"vad_speech_pad_ms={settings.vad_speech_pad_ms:.1f}",
         f"prompt_prepare_seconds={context.prompt_prepare_seconds:.3f}",
         f"prompt_cache_prepare_seconds={context.prompt_cache_prepare_seconds:.3f}",
     ]
@@ -245,6 +260,11 @@ def offline_summary_lines(
         f"source_tokenize_read_seconds={source_stats['read_seconds']:.3f}",
         f"source_tokenize_compute_seconds={source_stats['tokenize_seconds']:.3f}",
         f"source_tokenize_wall_seconds={source_stats['wall_seconds']:.3f}",
+        f"source_vad_enabled={source_stats['vad_enabled']}",
+        f"source_vad_speech_chunks={source_stats['vad_speech_chunks']}",
+        f"source_vad_silence_chunks={source_stats['vad_silence_chunks']}",
+        f"source_vad_silence_seconds={source_stats['vad_silence_seconds']:.3f}",
+        f"source_vad_compute_seconds={source_stats['vad_compute_seconds']:.3f}",
         f"stream_token_wait_seconds={token_wait_seconds:.3f}",
         f"stream_infer_compute_seconds={infer_compute_seconds:.3f}",
         f"stream_pipeline_compute_seconds={pipeline_compute_seconds:.3f}",
@@ -288,11 +308,89 @@ def align_audio_blend_samples(audio_blend_ms: float, sample_rate: int) -> int:
     return max(1, round(audio_blend_ms * sample_rate / 1000))
 
 
+class SileroVADGate:
+    sample_rate = 16000
+
+    def __init__(
+        self,
+        threshold: float,
+        min_speech_ms: float,
+        min_silence_ms: float,
+        speech_pad_ms: float,
+    ):
+        try:
+            from silero_vad import get_speech_timestamps, load_silero_vad
+        except ImportError as error:
+            raise RuntimeError(
+                "Silero VAD is enabled but the optional silero-vad package is not installed. "
+                "Install requirements.txt or run `pip install silero-vad`."
+            ) from error
+        self.threshold = threshold
+        self.min_speech_ms = int(round(min_speech_ms))
+        self.min_silence_ms = int(round(min_silence_ms))
+        self.speech_pad_ms = int(round(speech_pad_ms))
+        self.model = load_silero_vad()
+        self.get_speech_timestamps = get_speech_timestamps
+        if hasattr(self.model, "eval"):
+            self.model.eval()
+
+    def is_speech(self, audio: torch.Tensor | np.ndarray) -> bool:
+        if isinstance(audio, np.ndarray):
+            wav = torch.from_numpy(audio)
+        else:
+            wav = audio.detach().cpu()
+        wav = wav.flatten().to(dtype=torch.float32)
+        if wav.numel() == 0:
+            return False
+        with torch.inference_mode():
+            speech_timestamps = self.get_speech_timestamps(
+                wav,
+                self.model,
+                sampling_rate=self.sample_rate,
+                threshold=self.threshold,
+                min_speech_duration_ms=self.min_speech_ms,
+                min_silence_duration_ms=self.min_silence_ms,
+                speech_pad_ms=self.speech_pad_ms,
+            )
+        return bool(speech_timestamps)
+
+
+def create_vad_gate(settings: StreamSettings) -> SileroVADGate | None:
+    if not settings.vad_enabled:
+        return None
+    return SileroVADGate(
+        threshold=settings.vad_threshold,
+        min_speech_ms=settings.vad_min_speech_ms,
+        min_silence_ms=settings.vad_min_silence_ms,
+        speech_pad_ms=settings.vad_speech_pad_ms,
+    )
+
+
 def is_static_cache_aligned(history_tokens: int, model: VCOnlyModel) -> bool:
     if history_tokens <= 0:
         return False
     static_chunk_mel = model.flow.decoder.estimator.static_chunk_size
     return (history_tokens * model.token_mel_ratio) % static_chunk_mel == 0
+
+
+def build_token_speech_mask(
+    speech_spans: list[tuple[int, int, bool]],
+    start_token: int,
+    end_token: int,
+) -> torch.Tensor:
+    if end_token <= start_token:
+        return torch.zeros(0, dtype=torch.bool)
+    mask = torch.ones(end_token - start_token, dtype=torch.bool)
+    for span_start, span_end, is_speech in speech_spans:
+        if span_end <= start_token:
+            continue
+        if span_start >= end_token:
+            break
+        left = max(span_start, start_token) - start_token
+        right = min(span_end, end_token) - start_token
+        if right > left:
+            mask[left:right] = is_speech
+    return mask
 
 
 class AsyncSourceTokenizer:
@@ -305,6 +403,7 @@ class AsyncSourceTokenizer:
         chunk_sec: float,
         left_context_sec: float = 0.0,
         right_context_sec: float = 0.0,
+        vad_gate: SileroVADGate | None = None,
     ):
         if chunk_sec <= 0:
             raise ValueError("tokenizer chunk size must be positive")
@@ -317,9 +416,11 @@ class AsyncSourceTokenizer:
         self.chunk_samples = max(1, round(chunk_sec * 16000))
         self.left_context_samples = round(left_context_sec * 16000)
         self.right_context_samples = round(right_context_sec * 16000)
+        self.vad_gate = vad_gate
         self._condition = threading.Condition()
         self._thread: threading.Thread | None = None
         self._token_chunks: list[torch.Tensor] = []
+        self._speech_spans: list[tuple[int, int, bool]] = []
         self._token_count = 0
         self._done = False
         self._error: BaseException | None = None
@@ -330,6 +431,10 @@ class AsyncSourceTokenizer:
         self._audio_samples = 0
         self._window_audio_samples = 0
         self._chunks = 0
+        self._vad_compute_seconds = 0.0
+        self._vad_speech_chunks = 0
+        self._vad_silence_chunks = 0
+        self._vad_silence_samples = 0
 
     @property
     def started_at(self) -> float:
@@ -390,6 +495,18 @@ class AsyncSourceTokenizer:
             return torch.empty(1, 0, dtype=torch.int32)
         return torch.cat(pieces, dim=1)
 
+    def speech_mask(self, start_token: int, end_token: int) -> torch.Tensor:
+        if start_token < 0 or end_token < start_token:
+            raise ValueError(f"invalid token range: {start_token}:{end_token}")
+        self.wait_until(end_token)
+        with self._condition:
+            if end_token > self._token_count:
+                raise RuntimeError(
+                    f"requested speech mask {start_token}:{end_token}, "
+                    f"but only {self._token_count} source tokens are available"
+                )
+            return build_token_speech_mask(self._speech_spans, start_token, end_token)
+
     def stats(self) -> dict:
         with self._condition:
             finished_at = self._finished_at if self._finished_at is not None else time.perf_counter()
@@ -402,6 +519,11 @@ class AsyncSourceTokenizer:
                 "read_seconds": self._read_seconds,
                 "tokenize_seconds": self._tokenize_seconds,
                 "wall_seconds": finished_at - started_at,
+                "vad_enabled": self.vad_gate is not None,
+                "vad_compute_seconds": self._vad_compute_seconds,
+                "vad_speech_chunks": self._vad_speech_chunks,
+                "vad_silence_chunks": self._vad_silence_chunks,
+                "vad_silence_seconds": self._vad_silence_samples / 16000.0,
             }
 
     def _run(self) -> None:
@@ -419,6 +541,12 @@ class AsyncSourceTokenizer:
                     continue
                 window_start = max(0, start - self.left_context_samples)
                 window_end = min(total_samples, current_end + self.right_context_samples)
+                vad_is_speech = True
+                vad_seconds = 0.0
+                if self.vad_gate is not None:
+                    vad_start = time.perf_counter()
+                    vad_is_speech = self.vad_gate.is_speech(wav_16k[:, start:current_end])
+                    vad_seconds = time.perf_counter() - vad_start
                 chunk = wav_16k[:, window_start:window_end]
                 tokenize_start = time.perf_counter()
                 token = self.model.features.speech_token(chunk).cpu()
@@ -435,9 +563,17 @@ class AsyncSourceTokenizer:
                     self._audio_samples += current_end - start
                     self._window_audio_samples += window_end - window_start
                     self._tokenize_seconds += tokenize_seconds
+                    self._vad_compute_seconds += vad_seconds
+                    if vad_is_speech:
+                        self._vad_speech_chunks += 1
+                    else:
+                        self._vad_silence_chunks += 1
+                        self._vad_silence_samples += current_end - start
                     if token.shape[1] > 0:
+                        token_start = self._token_count
                         self._token_chunks.append(token)
                         self._token_count += token.shape[1]
+                        self._speech_spans.append((token_start, self._token_count, vad_is_speech))
                     self._condition.notify_all()
         except BaseException as error:
             with self._condition:
@@ -493,6 +629,7 @@ class MicrophoneSourceTokenizer:
         input_device: int | None = None,
         left_context_sec: float = 0.0,
         right_context_sec: float = 0.0,
+        vad_gate: SileroVADGate | None = None,
         log_fn: Callable[[str], None] | None = None,
     ):
         if chunk_sec <= 0:
@@ -506,12 +643,14 @@ class MicrophoneSourceTokenizer:
         self.chunk_samples = max(1, round(chunk_sec * 16000))
         self.left_context_samples = round(left_context_sec * 16000)
         self.right_context_samples = round(right_context_sec * 16000)
+        self.vad_gate = vad_gate
         self.log_fn = log_fn
         self._condition = threading.Condition()
         self._thread: threading.Thread | None = None
         self._audio_queue: queue.Queue[np.ndarray] = queue.Queue()
         self._stop_event = threading.Event()
         self._token_chunks: list[torch.Tensor] = []
+        self._speech_spans: list[tuple[int, int, bool]] = []
         self._audio = np.zeros(0, dtype=np.float32)
         self._next_start_sample = 0
         self._token_count = 0
@@ -524,6 +663,10 @@ class MicrophoneSourceTokenizer:
         self._audio_samples = 0
         self._window_audio_samples = 0
         self._chunks = 0
+        self._vad_compute_seconds = 0.0
+        self._vad_speech_chunks = 0
+        self._vad_silence_chunks = 0
+        self._vad_silence_samples = 0
 
     @property
     def started_at(self) -> float:
@@ -587,6 +730,18 @@ class MicrophoneSourceTokenizer:
             return torch.empty(1, 0, dtype=torch.int32)
         return torch.cat(pieces, dim=1)
 
+    def speech_mask(self, start_token: int, end_token: int) -> torch.Tensor:
+        if start_token < 0 or end_token < start_token:
+            raise ValueError(f"invalid token range: {start_token}:{end_token}")
+        self.wait_until(end_token)
+        with self._condition:
+            if end_token > self._token_count:
+                raise RuntimeError(
+                    f"requested speech mask {start_token}:{end_token}, "
+                    f"but only {self._token_count} source tokens are available"
+                )
+            return build_token_speech_mask(self._speech_spans, start_token, end_token)
+
     def stats(self) -> dict:
         with self._condition:
             finished_at = self._finished_at if self._finished_at is not None else time.perf_counter()
@@ -599,6 +754,11 @@ class MicrophoneSourceTokenizer:
                 "read_seconds": self._read_seconds,
                 "tokenize_seconds": self._tokenize_seconds,
                 "wall_seconds": finished_at - started_at,
+                "vad_enabled": self.vad_gate is not None,
+                "vad_compute_seconds": self._vad_compute_seconds,
+                "vad_speech_chunks": self._vad_speech_chunks,
+                "vad_silence_chunks": self._vad_silence_chunks,
+                "vad_silence_seconds": self._vad_silence_samples / 16000.0,
             }
 
     def _run(self) -> None:
@@ -670,7 +830,14 @@ class MicrophoneSourceTokenizer:
                 break
             window_start = max(0, start - self.left_context_samples)
             window_end = min(total_samples, current_end + self.right_context_samples)
-            chunk = torch.from_numpy(self._audio[window_start:window_end].copy()).float().unsqueeze(0)
+            vad_is_speech = True
+            vad_seconds = 0.0
+            if self.vad_gate is not None:
+                vad_start = time.perf_counter()
+                vad_is_speech = self.vad_gate.is_speech(self._audio[start:current_end])
+                vad_seconds = time.perf_counter() - vad_start
+            window_audio = self._audio[window_start:window_end].copy()
+            chunk = torch.from_numpy(window_audio).float().unsqueeze(0)
             tokenize_start = time.perf_counter()
             token = self.model.features.speech_token(chunk).cpu()
             tokenize_seconds = time.perf_counter() - tokenize_start
@@ -686,9 +853,17 @@ class MicrophoneSourceTokenizer:
                 self._audio_samples += current_end - start
                 self._window_audio_samples += window_end - window_start
                 self._tokenize_seconds += tokenize_seconds
+                self._vad_compute_seconds += vad_seconds
+                if vad_is_speech:
+                    self._vad_speech_chunks += 1
+                else:
+                    self._vad_silence_chunks += 1
+                    self._vad_silence_samples += current_end - start
                 if token.shape[1] > 0:
+                    token_start = self._token_count
                     self._token_chunks.append(token)
                     self._token_count += token.shape[1]
+                    self._speech_spans.append((token_start, self._token_count, vad_is_speech))
                 self._condition.notify_all()
             self._next_start_sample = current_end
 
@@ -843,6 +1018,7 @@ def run_window_stream(
     pending_overlap_mel = None
     pending_boundary_speech = None
     previous_speech_chunk = None
+    previous_vad_active = False
     emitted_mel_tail = None
     hift_stream_state = None
     hift_window_phase_state = None
@@ -968,6 +1144,24 @@ def run_window_stream(
                 f"stateful vocoder output has unexpected length: need {target_samples} samples, "
                 f"got {speech_chunk.shape[1]}"
             )
+        vad_speech_ratio = 1.0
+        vad_muted_samples = 0
+        if getattr(source_stream, "vad_gate", None) is not None and hasattr(source_stream, "speech_mask"):
+            token_speech_mask = source_stream.speech_mask(start_token, chunk_end)
+            if token_speech_mask.numel() != current_tokens:
+                raise RuntimeError(
+                    f"VAD speech mask has unexpected length: need {current_tokens} tokens, "
+                    f"got {token_speech_mask.numel()}"
+                )
+            if token_speech_mask.numel() > 0:
+                vad_speech_ratio = float(token_speech_mask.float().mean().item())
+            speech_chunk, vad_muted_samples, previous_vad_active = apply_vad_speech_gate(
+                speech=speech_chunk,
+                token_speech_mask=token_speech_mask,
+                samples_per_token=model.token_mel_ratio * hop_samples,
+                previous_active=previous_vad_active,
+                fade_samples=max(1, round(model.sample_rate * 0.01)),
+            )
         audio_blend_samples = 0
         if pending_boundary_speech is not None:
             audio_blend_samples = min(
@@ -1015,6 +1209,8 @@ def run_window_stream(
                 mel_blend_frames=blend_mel,
                 audio_blend_samples=audio_blend_samples,
                 audio_declick_samples=declick_samples,
+                vad_speech_ratio=vad_speech_ratio,
+                vad_muted_samples=vad_muted_samples,
                 output_seconds=output_seconds,
                 flow_seconds=flow_seconds,
                 hift_seconds=hift_seconds,
@@ -1106,6 +1302,59 @@ def blend_speech_chunks(previous: torch.Tensor, current: torch.Tensor) -> torch.
     return previous.to(current.device, dtype=current.dtype) * fade_out + current * fade_in
 
 
+def apply_vad_speech_gate(
+    speech: torch.Tensor,
+    token_speech_mask: torch.Tensor,
+    samples_per_token: int,
+    previous_active: bool,
+    fade_samples: int,
+) -> tuple[torch.Tensor, int, bool]:
+    if token_speech_mask.numel() == 0 or speech.shape[1] == 0:
+        return speech, 0, previous_active
+    raw_mask = token_speech_mask.to(device=speech.device, dtype=speech.dtype).repeat_interleave(samples_per_token)
+    target_samples = speech.shape[1]
+    if raw_mask.numel() < target_samples:
+        pad_value = raw_mask[-1] if raw_mask.numel() > 0 else torch.tensor(0.0, device=speech.device, dtype=speech.dtype)
+        raw_mask = torch.cat([raw_mask, pad_value.repeat(target_samples - raw_mask.numel())])
+    raw_mask = raw_mask[:target_samples]
+    audio_mask = raw_mask.clone()
+    fade_samples = min(max(0, fade_samples), target_samples)
+    if fade_samples > 1:
+        active = raw_mask > 0.5
+        if bool(active[0].item()) and not previous_active:
+            end = min(fade_samples, target_samples)
+            audio_mask[:end] = torch.minimum(
+                audio_mask[:end],
+                torch.linspace(0.0, 1.0, end, device=speech.device, dtype=speech.dtype),
+            )
+        if not bool(active[0].item()) and previous_active:
+            end = min(fade_samples, target_samples)
+            audio_mask[:end] = torch.maximum(
+                audio_mask[:end],
+                torch.linspace(1.0, 0.0, end, device=speech.device, dtype=speech.dtype),
+            )
+        transitions = torch.nonzero(active[1:] != active[:-1], as_tuple=False).flatten() + 1
+        for index_tensor in transitions:
+            index = int(index_tensor.item())
+            end = min(index + fade_samples, target_samples)
+            if end <= index:
+                continue
+            if bool(active[index].item()):
+                audio_mask[index:end] = torch.minimum(
+                    audio_mask[index:end],
+                    torch.linspace(0.0, 1.0, end - index, device=speech.device, dtype=speech.dtype),
+                )
+            else:
+                audio_mask[index:end] = torch.maximum(
+                    audio_mask[index:end],
+                    torch.linspace(1.0, 0.0, end - index, device=speech.device, dtype=speech.dtype),
+                )
+    muted_samples = int(torch.count_nonzero(raw_mask <= 0.5).item())
+    if muted_samples == 0 and torch.all(audio_mask >= 1.0).item():
+        return speech, 0, bool(token_speech_mask[-1].item())
+    return speech * audio_mask.view(1, -1), muted_samples, bool(token_speech_mask[-1].item())
+
+
 def hift_required_right_context_mel(model: VCOnlyModel, hop_samples: int) -> int:
     f0_right = getattr(model.hift.f0_predictor.condnet[0], "causal_padding", 0)
     conv_pre_right = getattr(model.hift, "conv_pre_look_right", 0)
@@ -1156,6 +1405,8 @@ def make_row(
     mel_blend_frames: int,
     audio_blend_samples: int,
     audio_declick_samples: int,
+    vad_speech_ratio: float,
+    vad_muted_samples: int,
     output_seconds: float,
     flow_seconds: float,
     hift_seconds: float,
@@ -1177,6 +1428,8 @@ def make_row(
         "mel_blend_frames": mel_blend_frames,
         "audio_blend_samples": audio_blend_samples,
         "audio_declick_samples": audio_declick_samples,
+        "vad_speech_ratio": vad_speech_ratio,
+        "vad_muted_samples": vad_muted_samples,
         "input_seconds": input_seconds,
         "output_seconds": output_seconds,
         "flow_seconds": flow_seconds,
@@ -1197,6 +1450,7 @@ def print_chunk(row: dict, chunk_start_wall: float, log_fn: Callable[[str], None
         "history_cache_hit={history_cache_hit} "
         "source_mel_offset={source_mel_offset} mel_blend_frames={mel_blend_frames} "
         "audio_blend_samples={audio_blend_samples} audio_declick_samples={audio_declick_samples} "
+        "vad_speech_ratio={vad_speech_ratio:.2f} vad_muted_samples={vad_muted_samples} "
         "token_wait={token_wait_seconds:.3f}s flow={flow_seconds:.3f}s hift={hift_seconds:.3f}s compute={compute_seconds:.3f}s "
         "rtf={chunk_rtf:.3f} wall={wall:.3f}s finalize={finalize}".format(
             **row,
@@ -1462,6 +1716,11 @@ class VCStudioApp:
         self.delayed_commit_sec_var = tk.StringVar(value=f"{args.delayed_commit_sec:g}")
         self.audio_declick_ms_var = tk.StringVar(value=f"{args.audio_declick_ms:g}")
         self.audio_blend_ms_var = tk.StringVar(value=f"{args.audio_blend_ms:g}")
+        self.vad_enabled_var = tk.BooleanVar(value=args.enable_vad)
+        self.vad_threshold_var = tk.StringVar(value=f"{args.vad_threshold:g}")
+        self.vad_min_speech_ms_var = tk.StringVar(value=f"{args.vad_min_speech_ms:g}")
+        self.vad_min_silence_ms_var = tk.StringVar(value=f"{args.vad_min_silence_ms:g}")
+        self.vad_speech_pad_ms_var = tk.StringVar(value=f"{args.vad_speech_pad_ms:g}")
         self.flow_context_var = tk.StringVar(value=args.flow_context)
         self.hift_mode_var = tk.StringVar(value=args.hift_mode)
         self.prompt_cache_var = tk.BooleanVar(value=not args.disable_prompt_kv_cache)
@@ -1733,12 +1992,17 @@ class VCStudioApp:
         ttk.Label(right, text="Quality / Runtime", style="Card.TLabel", font=("Helvetica", 14, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
         self._number_row(right, 1, "De-click ms", self.audio_declick_ms_var)
         self._number_row(right, 2, "Audio blend ms", self.audio_blend_ms_var)
-        ttk.Label(right, text="Flow context", style="Card.TLabel").grid(row=3, column=0, sticky="w", pady=6)
-        ttk.Combobox(right, textvariable=self.flow_context_var, values=["streaming", "window-full"], state="readonly").grid(row=3, column=1, sticky="ew", pady=6)
-        ttk.Label(right, text="HiFT mode", style="Card.TLabel").grid(row=4, column=0, sticky="w", pady=6)
-        ttk.Combobox(right, textvariable=self.hift_mode_var, values=["stateful", "window"], state="readonly").grid(row=4, column=1, sticky="ew", pady=6)
-        ttk.Checkbutton(right, text="Prompt KV cache", variable=self.prompt_cache_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=(12, 2))
-        ttk.Checkbutton(right, text="History KV cache", variable=self.history_cache_var).grid(row=6, column=0, columnspan=2, sticky="w", pady=2)
+        ttk.Checkbutton(right, text="Silero VAD gate", variable=self.vad_enabled_var).grid(row=3, column=0, columnspan=2, sticky="w", pady=(12, 2))
+        self._number_row(right, 4, "VAD threshold", self.vad_threshold_var)
+        self._number_row(right, 5, "VAD min speech ms", self.vad_min_speech_ms_var)
+        self._number_row(right, 6, "VAD min silence ms", self.vad_min_silence_ms_var)
+        self._number_row(right, 7, "VAD speech pad ms", self.vad_speech_pad_ms_var)
+        ttk.Label(right, text="Flow context", style="Card.TLabel").grid(row=8, column=0, sticky="w", pady=6)
+        ttk.Combobox(right, textvariable=self.flow_context_var, values=["streaming", "window-full"], state="readonly").grid(row=8, column=1, sticky="ew", pady=6)
+        ttk.Label(right, text="HiFT mode", style="Card.TLabel").grid(row=9, column=0, sticky="w", pady=6)
+        ttk.Combobox(right, textvariable=self.hift_mode_var, values=["stateful", "window"], state="readonly").grid(row=9, column=1, sticky="ew", pady=6)
+        ttk.Checkbutton(right, text="Prompt KV cache", variable=self.prompt_cache_var).grid(row=10, column=0, columnspan=2, sticky="w", pady=(12, 2))
+        ttk.Checkbutton(right, text="History KV cache", variable=self.history_cache_var).grid(row=11, column=0, columnspan=2, sticky="w", pady=2)
         left.columnconfigure(1, weight=1)
         right.columnconfigure(1, weight=1)
 
@@ -1906,6 +2170,19 @@ class VCStudioApp:
         tokenizer_right_context_sec = self._nonnegative_float(self.tokenizer_right_context_sec_var, "Tokenizer right context")
         if effective_tokenizer_chunk_sec + tokenizer_left_context_sec + tokenizer_right_context_sec > 30:
             raise ValueError("Tokenizer chunk plus left/right context must be 30 seconds or less.")
+        vad_enabled = self.vad_enabled_var.get()
+        vad_threshold = self._float_in_range(self.vad_threshold_var, "VAD threshold", 0.0, 1.0)
+        vad_min_speech_ms = self._nonnegative_float(self.vad_min_speech_ms_var, "VAD min speech ms")
+        vad_min_silence_ms = self._nonnegative_float(self.vad_min_silence_ms_var, "VAD min silence ms")
+        vad_speech_pad_ms = self._nonnegative_float(self.vad_speech_pad_ms_var, "VAD speech pad ms")
+        if vad_enabled:
+            import importlib.util
+
+            if importlib.util.find_spec("silero_vad") is None:
+                raise ValueError(
+                    "Silero VAD is enabled, but the optional silero-vad package is not installed. "
+                    "Install requirements.txt or run `pip install silero-vad`."
+                )
         return StreamSettings(
             chunk_sec=chunk_sec,
             tokenizer_chunk_sec=tokenizer_chunk_sec if tokenizer_chunk_sec > 0 else None,
@@ -1916,6 +2193,11 @@ class VCStudioApp:
             delayed_commit_sec=self._nonnegative_float(self.delayed_commit_sec_var, "Delayed commit sec"),
             audio_declick_ms=self._nonnegative_float(self.audio_declick_ms_var, "De-click ms"),
             audio_blend_ms=self._nonnegative_float(self.audio_blend_ms_var, "Audio blend ms"),
+            vad_enabled=vad_enabled,
+            vad_threshold=vad_threshold,
+            vad_min_speech_ms=vad_min_speech_ms,
+            vad_min_silence_ms=vad_min_silence_ms,
+            vad_speech_pad_ms=vad_speech_pad_ms,
             flow_context=self.flow_context_var.get(),
             hift_mode=self.hift_mode_var.get(),
             disable_prompt_kv_cache=not self.prompt_cache_var.get(),
@@ -1934,6 +2216,12 @@ class VCStudioApp:
             raise ValueError(f"{name} must be 0 or greater.")
         return value
 
+    def _float_in_range(self, variable, name: str, minimum: float, maximum: float) -> float:
+        value = self._float(variable, name)
+        if value < minimum or value > maximum:
+            raise ValueError(f"{name} must be between {minimum:g} and {maximum:g}.")
+        return value
+
     def _float(self, variable, name: str) -> float:
         try:
             return float(variable.get())
@@ -1948,12 +2236,15 @@ class VCStudioApp:
             context = prepare_stream_context(model, config["prompt"], config["settings"])
             for line in stream_context_log_lines(model, config["settings"], context):
                 self._post("log", line)
+            self._post("status", "Loading Silero VAD..." if config["settings"].vad_enabled else "Preparing source...")
+            vad_gate = create_vad_gate(config["settings"])
             source_tokenizer = AsyncSourceTokenizer(
                 model,
                 config["source"],
                 context.tokenizer_chunk_sec,
                 left_context_sec=config["settings"].tokenizer_left_context_sec,
                 right_context_sec=config["settings"].tokenizer_right_context_sec,
+                vad_gate=vad_gate,
             )
             source_tokenizer.start()
             try:
@@ -2005,6 +2296,8 @@ class VCStudioApp:
             context = prepare_stream_context(model, config["prompt"], config["settings"])
             for line in stream_context_log_lines(model, config["settings"], context):
                 self._post("log", line)
+            self._post("status", "Loading Silero VAD..." if config["settings"].vad_enabled else "Opening audio output...")
+            vad_gate = create_vad_gate(config["settings"])
             player = RealtimeAudioPlayer(
                 sample_rate=model.sample_rate,
                 output_device=config.get("output_device"),
@@ -2017,6 +2310,7 @@ class VCStudioApp:
                 input_device=config.get("input_device"),
                 left_context_sec=config["settings"].tokenizer_left_context_sec,
                 right_context_sec=config["settings"].tokenizer_right_context_sec,
+                vad_gate=vad_gate,
                 log_fn=lambda message: self._post("log", message),
             )
             self.live_source = source

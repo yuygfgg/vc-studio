@@ -7,6 +7,7 @@ omegaconf==2.3.0
 onnxruntime>=1.18
 openai-whisper>=20231117
 scipy>=1.10
+silero-vad>=5.1
 soundfile>=0.12
 sounddevice>=0.4.7
 torch>=2.3
