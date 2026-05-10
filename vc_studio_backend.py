@@ -10,7 +10,7 @@ import threading
 import time
 import warnings
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable, Mapping
 
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 os.environ.setdefault("HF_HOME", "/tmp/cosyvoice_hf_cache")
@@ -21,13 +21,36 @@ warnings.filterwarnings(
 )
 
 import numpy as np
+import soundfile as sf
 import torch
 
 from cosyvoice.vc.audio import mel_spectrogram_24000, read_mono, write_wav
 from cosyvoice.vc.model import VCOnlyModel, align_prompt_token_feat
+from cosyvoice.vc.voice_package import (
+    APP_VERSION,
+    FORMAT_NAME,
+    FORMAT_VERSION,
+    MEL_BINS,
+    MODEL_FAMILY,
+    SAMPLE_RATE,
+    SPEAKER_EMBEDDING_DIM,
+    TOKENIZER_SAFE_SECONDS,
+    TOKENIZER_SAMPLE_RATE,
+    TOKEN_MEL_RATIO,
+    TOKEN_RATE,
+    VoicePromptInputs,
+    l2_normalize_array,
+    load_voice_package,
+    model_compatibility_fields,
+    new_package_id,
+    save_voice_package,
+    sha256_file,
+    sharpen_weights,
+    utc_now_iso,
+)
 
 
-def prepare_prompt_inputs(
+def prepare_prompt_inputs_from_wav(
     model: VCOnlyModel,
     prompt_wav: str | Path,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -41,14 +64,458 @@ def prepare_prompt_inputs(
     return prompt_token, prompt_feat, embedding
 
 
+def prepare_prompt_inputs_from_package(
+    model: VCOnlyModel,
+    package_path: str | Path,
+) -> VoicePromptInputs:
+    return load_voice_package(package_path, model=model, device=model.device)
+
+
+def prepare_prompt_inputs(
+    model: VCOnlyModel,
+    prompt_wav: str | Path,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return prepare_prompt_inputs_from_wav(model, prompt_wav)
+
+
+def select_runtime_prompt_inputs(prompt_inputs: VoicePromptInputs) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    branch_index = prompt_inputs.dominant_branch_index()
+    branch = prompt_inputs.branches[branch_index]
+    return branch.prompt_token, branch.prompt_feat, prompt_inputs.fused_embedding, branch_index
+
+
+def prepare_grouped_prompt_cache(
+    model: VCOnlyModel,
+    prompt_inputs: VoicePromptInputs,
+    streaming: bool,
+    max_cache_mel_frames: int | None = None,
+    cache_storage_dtype: torch.dtype | None = None,
+    offload_kv_to_cpu: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, dict[str, Any]]:
+    sharpened_weights = prompt_inputs.sharpened_weights()
+    active_indices = [index for index, weight in enumerate(sharpened_weights) if weight > 0.0]
+    if not active_indices:
+        raise ValueError("voice package has no active prompt branches")
+    dominant_index = prompt_inputs.dominant_branch_index()
+    if dominant_index not in active_indices:
+        dominant_index = active_indices[0]
+
+    branch_caches = []
+    dominant_token = None
+    dominant_feat = None
+    dominant_cache = None
+    for branch_index in active_indices:
+        branch = prompt_inputs.branches[branch_index]
+        branch_token, branch_feat = trim_prompt_to_static_cache(
+            branch.prompt_token,
+            branch.prompt_feat,
+            model,
+            max_mel_frames=max_cache_mel_frames,
+        )
+        token_len = torch.tensor([branch_token.shape[1]], dtype=torch.int32, device=model.device)
+        feat_len = torch.tensor([branch_feat.shape[1]], dtype=torch.int32, device=model.device)
+        cache_len, cache = model.flow.prepare_prompt_cache(
+            prompt_token=branch_token,
+            prompt_token_len=token_len,
+            prompt_feat=branch_feat,
+            prompt_feat_len=feat_len,
+            embedding=branch.embedding,
+            streaming=streaming,
+        )
+        if cache is None or cache_len <= 0:
+            raise ValueError(
+                "multi-branch voice packages require each active reference to be long enough for static prompt cache"
+            )
+        optimize_prompt_cache_storage(cache, cache_storage_dtype, offload_kv_to_cpu=offload_kv_to_cpu)
+        branch_record = {
+            "branch_index": branch_index,
+            "weight": float(sharpened_weights[branch_index]),
+            "cache_len": int(cache_len),
+            "cache": cache,
+        }
+        branch_caches.append(branch_record)
+        if branch_index == dominant_index:
+            dominant_token = branch_token
+            dominant_feat = branch_feat
+            dominant_cache = cache
+
+    if dominant_token is None or dominant_feat is None or dominant_cache is None:
+        raise ValueError("dominant prompt branch was not prepared")
+
+    fused_spks = torch.nn.functional.normalize(prompt_inputs.fused_embedding, dim=1)
+    fused_spks = model.flow.spk_embed_affine_layer(fused_spks)
+    branch_weights = torch.tensor(
+        [record["weight"] for record in branch_caches],
+        dtype=torch.float32,
+        device=model.device,
+    )
+    steps = []
+    for step_index, dominant_step in enumerate(dominant_cache["steps"]):
+        branch_prompt_caches = [record["cache"]["steps"][step_index]["prompt_cache"] for record in branch_caches]
+        grouped_kv, grouped_mask = _stack_grouped_prompt_kv(branch_prompt_caches)
+        prompt_inputs_for_step = dict(dominant_step["prompt_inputs"])
+        spks_in = torch.zeros_like(prompt_inputs_for_step["spks_in"])
+        spks_in[: fused_spks.shape[0]] = fused_spks
+        prompt_inputs_for_step["spks_in"] = spks_in
+        steps.append(
+            {
+                "prompt_cache": {
+                    "grouped_branch_attention": True,
+                    "grouped_kv": grouped_kv,
+                    "grouped_prompt_mask": grouped_mask,
+                    "branch_weights": branch_weights,
+                    "branch_indices": [record["branch_index"] for record in branch_caches],
+                    "branch_cache_lens": [record["cache_len"] for record in branch_caches],
+                    "prompt_len": int(dominant_cache["cache_len"]),
+                    "base_prompt_len": int(dominant_cache["cache_len"]),
+                    "input_embed_cache": dominant_step["prompt_cache"].get("input_embed_cache"),
+                    "attention_temperature": float(prompt_inputs.metadata.get("attention_temperature", 1.0)),
+                },
+                "prompt_inputs": prompt_inputs_for_step,
+            }
+        )
+
+    grouped_cache = {
+        "grouped_branch_attention": True,
+        "steps": steps,
+        "final_prompt_x": dominant_cache["final_prompt_x"],
+        "cache_len": int(dominant_cache["cache_len"]),
+        "base_cache_len": int(dominant_cache["cache_len"]),
+        "history_cache_len": 0,
+        "base_cache": None,
+        "flow_token_tail": dominant_cache.get("flow_token_tail"),
+        "branch_indices": [record["branch_index"] for record in branch_caches],
+        "branch_weights": [record["weight"] for record in branch_caches],
+    }
+    return dominant_token, dominant_feat, prompt_inputs.fused_embedding, dominant_index, int(dominant_cache["cache_len"]), grouped_cache
+
+
+def _stack_grouped_prompt_kv(
+    branch_prompt_caches: list[dict[str, Any]],
+) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
+    depth = len(branch_prompt_caches[0]["kv"])
+    grouped_kv = []
+    grouped_mask = None
+    for block_index in range(depth):
+        keys = [cache["kv"][block_index][0] for cache in branch_prompt_caches]
+        values = [cache["kv"][block_index][1] for cache in branch_prompt_caches]
+        max_len = max(key.shape[2] for key in keys)
+        first_key = keys[0]
+        first_value = values[0]
+        key_stack = first_key.new_zeros((len(keys), first_key.shape[0], first_key.shape[1], max_len, first_key.shape[3]))
+        value_stack = first_value.new_zeros(
+            (len(values), first_value.shape[0], first_value.shape[1], max_len, first_value.shape[3])
+        )
+        mask = torch.zeros((len(keys), max_len), dtype=torch.bool, device=first_key.device)
+        for branch_pos, (key, value) in enumerate(zip(keys, values)):
+            length = key.shape[2]
+            key_stack[branch_pos, :, :, :length] = key
+            value_stack[branch_pos, :, :, :length] = value
+            mask[branch_pos, :length] = True
+        grouped_kv.append((key_stack, value_stack))
+        if grouped_mask is None:
+            grouped_mask = mask
+    if grouped_mask is None:
+        raise ValueError("grouped prompt cache has no transformer blocks")
+    return grouped_kv, grouped_mask
+
+
+def prepare_grouped_prompt_runtime_inputs(prompt_inputs: VoicePromptInputs) -> dict[str, Any]:
+    sharpened_weights = prompt_inputs.sharpened_weights()
+    active_indices = [index for index, weight in enumerate(sharpened_weights) if weight > 0.0]
+    if not active_indices:
+        raise ValueError("voice package has no active prompt branches")
+    dominant_index = prompt_inputs.dominant_branch_index()
+    if dominant_index not in active_indices:
+        dominant_index = active_indices[0]
+    return {
+        "prompt_tokens": [prompt_inputs.branches[index].prompt_token for index in active_indices],
+        "prompt_feats": [prompt_inputs.branches[index].prompt_feat for index in active_indices],
+        "embeddings": [prompt_inputs.branches[index].embedding for index in active_indices],
+        "branch_weights": [float(sharpened_weights[index]) for index in active_indices],
+        "branch_indices": active_indices,
+        "dominant_branch_index": dominant_index,
+        "dominant_branch_position": active_indices.index(dominant_index),
+        "attention_temperature": float(prompt_inputs.metadata.get("attention_temperature", 1.0)),
+    }
+
+
+def prompt_cache_memory_limit_bytes(max_mb: float | None = None) -> int:
+    if max_mb is None:
+        value = os.environ.get("VC_STUDIO_PROMPT_CACHE_MAX_MB", "1024").strip()
+        try:
+            megabytes = float(value)
+        except ValueError:
+            megabytes = 1024.0
+    else:
+        megabytes = float(max_mb)
+    if megabytes <= 0:
+        return 0
+    return int(megabytes * 1024 * 1024)
+
+
+def grouped_prompt_cache_enabled(enabled: bool | None = None) -> bool:
+    if enabled is not None:
+        return bool(enabled)
+    return os.environ.get("VC_STUDIO_ENABLE_GROUPED_PROMPT_CACHE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def grouped_prompt_enabled(enabled: bool | None = None) -> bool:
+    if enabled is not None:
+        return bool(enabled)
+    return os.environ.get("VC_STUDIO_ENABLE_GROUPED_PROMPT", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def prompt_cache_storage_dtype(model: VCOnlyModel, mode: str | None = None) -> torch.dtype | None:
+    value = (mode or os.environ.get("VC_STUDIO_PROMPT_CACHE_DTYPE", "auto")).strip().lower()
+    if value in {"", "auto"}:
+        if model.device.type in {"cuda", "mps"}:
+            return torch.float16
+        return None
+    if value in {"float32", "fp32", "none", "off"}:
+        return None
+    if value in {"float16", "fp16", "half"}:
+        return torch.float16
+    if value in {"bfloat16", "bf16"}:
+        return torch.bfloat16
+    return None
+
+
+def prompt_cache_dtype_bytes(storage_dtype: torch.dtype | None) -> int:
+    if storage_dtype in {torch.float16, torch.bfloat16}:
+        return 2
+    return 4
+
+
+def prompt_cache_offload_kv_to_cpu(storage: str | None = None) -> bool:
+    if storage is not None:
+        return storage.strip().lower() in {"cpu", "cpu_offload", "offload"}
+    return os.environ.get("VC_STUDIO_PROMPT_CACHE_OFFLOAD", "").strip().lower() in {"1", "true", "yes", "on", "cpu"}
+
+
+def prompt_cache_max_seconds(max_seconds: float | None = None) -> float | None:
+    if max_seconds is not None:
+        seconds = float(max_seconds)
+        return seconds if seconds > 0 else None
+    value = os.environ.get("VC_STUDIO_PROMPT_CACHE_MAX_SECONDS", "").strip()
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        return None
+    if seconds <= 0:
+        return None
+    return seconds
+
+
+def choose_prompt_cache_budget_frames(
+    model: VCOnlyModel,
+    prompt_mel_frames: int,
+    *,
+    branch_count: int = 1,
+    dtype_bytes: int = 4,
+    max_mb: float | None = None,
+    max_seconds: float | None = None,
+) -> tuple[int, str | None]:
+    trimmed_frames = trim_cache_mel_frames_to_static(model, prompt_mel_frames)
+    if trimmed_frames <= 0:
+        return 0, "prompt is too short for static prompt KV cache"
+
+    notes = []
+    max_cache_seconds = prompt_cache_max_seconds(max_seconds)
+    if max_cache_seconds is not None:
+        second_limited = trim_cache_mel_frames_to_static(model, int(max_cache_seconds * TOKEN_RATE * TOKEN_MEL_RATIO))
+        if second_limited > 0 and second_limited < trimmed_frames:
+            notes.append(
+                f"prompt KV cache clipped by max seconds from "
+                f"{trimmed_frames / (TOKEN_RATE * TOKEN_MEL_RATIO):.2f}s to "
+                f"{second_limited / (TOKEN_RATE * TOKEN_MEL_RATIO):.2f}s"
+            )
+            trimmed_frames = second_limited
+
+    limit = prompt_cache_memory_limit_bytes(max_mb)
+    estimated = estimate_prompt_cache_bytes(model, trimmed_frames, branch_count=branch_count, dtype_bytes=dtype_bytes)
+    if limit > 0 and estimated > limit:
+        bytes_per_frame = max(1, estimate_prompt_cache_bytes(model, 1, branch_count=branch_count, dtype_bytes=dtype_bytes))
+        budget_frames = trim_cache_mel_frames_to_static(model, limit // bytes_per_frame)
+        if budget_frames <= 0:
+            return 0, (
+                f"prompt KV cache estimate {format_bytes(estimated)} exceeds limit {format_bytes(limit)} "
+                "and even one static cache chunk does not fit"
+            )
+        if budget_frames < trimmed_frames:
+            notes.append(
+                f"prompt KV cache clipped by memory budget from "
+                f"{trimmed_frames / (TOKEN_RATE * TOKEN_MEL_RATIO):.2f}s to "
+                f"{budget_frames / (TOKEN_RATE * TOKEN_MEL_RATIO):.2f}s "
+                f"({format_bytes(estimate_prompt_cache_bytes(model, budget_frames, branch_count=branch_count, dtype_bytes=dtype_bytes))} "
+                f"<= {format_bytes(limit)})"
+            )
+            trimmed_frames = budget_frames
+    return trimmed_frames, "; ".join(notes) if notes else None
+
+
+def choose_full_prompt_cache_frames(
+    model: VCOnlyModel,
+    prompt_mel_frames: int,
+    *,
+    branch_count: int = 1,
+    dtype_bytes: int = 4,
+    max_mb: float | None = None,
+    max_seconds: float | None = None,
+) -> tuple[int, str | None]:
+    full_frames = int(prompt_mel_frames)
+    aligned_frames = trim_cache_mel_frames_to_static(model, full_frames)
+    if aligned_frames <= 0:
+        return 0, "prompt is too short for static prompt KV cache"
+    if aligned_frames != full_frames:
+        return 0, (
+            "prompt KV cache disabled because the full prompt is not aligned to the "
+            "DiT static cache grid; running without cache preserves prompt quality"
+        )
+
+    max_cache_seconds = prompt_cache_max_seconds(max_seconds)
+    if max_cache_seconds is not None:
+        max_frames = trim_cache_mel_frames_to_static(model, int(max_cache_seconds * TOKEN_RATE * TOKEN_MEL_RATIO))
+        if max_frames <= 0 or full_frames > max_frames:
+            return 0, (
+                f"prompt KV cache disabled because the full prompt "
+                f"({full_frames / (TOKEN_RATE * TOKEN_MEL_RATIO):.2f}s) exceeds "
+                f"prompt cache max seconds ({max_cache_seconds:.2f}s); running without cache preserves prompt quality"
+            )
+
+    limit = prompt_cache_memory_limit_bytes(max_mb)
+    estimated = estimate_prompt_cache_bytes(model, full_frames, branch_count=branch_count, dtype_bytes=dtype_bytes)
+    if limit > 0 and estimated > limit:
+        return 0, (
+            f"prompt KV cache estimate {format_bytes(estimated)} exceeds limit {format_bytes(limit)}; "
+            "running without cache preserves prompt quality"
+        )
+    return full_frames, None
+
+
+def trim_cache_mel_frames_to_static(model: VCOnlyModel, mel_frames: int) -> int:
+    static_chunk_mel = model.flow.decoder.estimator.static_chunk_size
+    if static_chunk_mel <= 0:
+        return max(0, int(mel_frames))
+    return max(0, int(mel_frames) // static_chunk_mel * static_chunk_mel)
+
+
+def estimate_prompt_cache_bytes(
+    model: VCOnlyModel,
+    prompt_mel_frames: int,
+    *,
+    branch_count: int = 1,
+    diffusion_steps: int = 10,
+    cfg_batch: int = 2,
+    dtype_bytes: int = 4,
+) -> int:
+    estimator = model.flow.decoder.estimator
+    layers = len(estimator.transformer_blocks)
+    if layers <= 0 or prompt_mel_frames <= 0 or branch_count <= 0:
+        return 0
+    first_attn = estimator.transformer_blocks[0].attn
+    heads = int(first_attn.heads)
+    head_dim = int(first_attn.inner_dim // first_attn.heads)
+    kv_count = 2
+    return int(branch_count * diffusion_steps * layers * kv_count * cfg_batch * heads * prompt_mel_frames * head_dim * dtype_bytes)
+
+
+def optimize_prompt_cache_storage(
+    prompt_cache_steps,
+    storage_dtype: torch.dtype | None,
+    *,
+    offload_kv_to_cpu: bool = False,
+) -> None:
+    if prompt_cache_steps is None:
+        return
+    target_device = torch.device("cpu") if offload_kv_to_cpu else None
+    for step in prompt_cache_steps.get("steps", []):
+        prompt_cache = step.get("prompt_cache", {})
+        if "kv" in prompt_cache:
+            prompt_cache["kv"] = optimize_kv_list(prompt_cache["kv"], storage_dtype, target_device)
+        if "history_kv" in prompt_cache:
+            prompt_cache["history_kv"] = optimize_kv_list(prompt_cache["history_kv"], storage_dtype, target_device)
+        if "grouped_kv" in prompt_cache:
+            prompt_cache["grouped_kv"] = optimize_kv_list(prompt_cache["grouped_kv"], storage_dtype, target_device)
+        if offload_kv_to_cpu and "grouped_prompt_mask" in prompt_cache:
+            prompt_cache["grouped_prompt_mask"] = prompt_cache["grouped_prompt_mask"].cpu()
+        input_embed_cache = prompt_cache.get("input_embed_cache")
+        if isinstance(input_embed_cache, dict):
+            prompt_cache["input_embed_cache"] = optimize_tensor_tree(input_embed_cache, storage_dtype, target_device)
+
+
+def optimize_kv_list(
+    kv_list: list[tuple[torch.Tensor, torch.Tensor]],
+    storage_dtype: torch.dtype | None,
+    target_device: torch.device | None,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    return [
+        (
+            optimize_tensor(key, storage_dtype, target_device),
+            optimize_tensor(value, storage_dtype, target_device),
+        )
+        for key, value in kv_list
+    ]
+
+
+def optimize_tensor_tree(value, storage_dtype: torch.dtype | None, target_device: torch.device | None):
+    if isinstance(value, torch.Tensor):
+        return optimize_tensor(value, storage_dtype, target_device)
+    if isinstance(value, dict):
+        return {key: optimize_tensor_tree(item, storage_dtype, target_device) for key, item in value.items()}
+    if isinstance(value, list):
+        return [optimize_tensor_tree(item, storage_dtype, target_device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(optimize_tensor_tree(item, storage_dtype, target_device) for item in value)
+    return value
+
+
+def optimize_tensor(
+    tensor: torch.Tensor,
+    storage_dtype: torch.dtype | None,
+    target_device: torch.device | None,
+) -> torch.Tensor:
+    if not tensor.is_floating_point():
+        return tensor.to(device=target_device) if target_device is not None else tensor
+    kwargs: dict[str, Any] = {}
+    if storage_dtype is not None:
+        kwargs["dtype"] = storage_dtype
+    if target_device is not None:
+        kwargs["device"] = target_device
+    if not kwargs:
+        return tensor
+    return tensor.to(**kwargs)
+
+
+def format_bytes(value: int) -> str:
+    amount = float(value)
+    for unit in ("B", "MiB", "GiB"):
+        if unit == "B":
+            if amount < 1024:
+                return f"{int(amount)} B"
+            amount /= 1024.0
+            continue
+        if amount < 1024 or unit == "GiB":
+            return f"{amount:.2f} {unit}"
+        amount /= 1024.0
+    return f"{value} B"
+
+
 def trim_prompt_to_static_cache(
     prompt_token: torch.Tensor,
     prompt_feat: torch.Tensor,
     model: VCOnlyModel,
+    max_mel_frames: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     static_chunk_mel = model.flow.decoder.estimator.static_chunk_size
     token_multiple = max(1, static_chunk_mel // model.token_mel_ratio)
     token_frames = (prompt_token.shape[1] // token_multiple) * token_multiple
+    if max_mel_frames is not None:
+        max_token_frames = max(0, int(max_mel_frames) // model.token_mel_ratio)
+        max_token_frames = (max_token_frames // token_multiple) * token_multiple
+        token_frames = min(token_frames, max_token_frames)
     if token_frames <= 0:
         return prompt_token, prompt_feat
     mel_frames = token_frames * model.token_mel_ratio
@@ -75,6 +542,12 @@ class StreamSettings:
     hift_mode: str
     disable_prompt_kv_cache: bool
     disable_history_kv_cache: bool
+    prompt_cache_max_mb: float = 1024.0
+    prompt_cache_max_seconds: float = 0.0
+    prompt_cache_dtype: str = "auto"
+    prompt_cache_storage: str = "device"
+    enable_grouped_prompt: bool = False
+    enable_grouped_prompt_cache: bool = False
 
 
 @dataclass(frozen=True)
@@ -82,6 +555,7 @@ class BackendConfig:
     model_dir: str
     prompt: str
     settings: StreamSettings
+    voice_package: str = ""
     source: str = ""
     output: str = "out/vc_streaming.wav"
     csv: str = ""
@@ -111,11 +585,18 @@ class PreparedStreamContext:
     prompt_cache_steps: object | None
     prompt_prepare_seconds: float
     prompt_cache_prepare_seconds: float
+    prompt_source_kind: str = "legacy_wav"
+    voice_package_metadata: dict[str, Any] | None = None
+    selected_branch_index: int | None = None
+    prompt_cache_disabled_reason: str | None = None
+    grouped_prompt_inputs: dict[str, Any] | None = None
+    use_grouped_prompt: bool = False
+    use_grouped_prompt_cache: bool = False
 
 
 def prepare_stream_context(
     model: VCOnlyModel,
-    prompt_wav: str | Path,
+    prompt_source: str | Path | VoicePromptInputs,
     settings: StreamSettings,
 ) -> PreparedStreamContext:
     chunk_tokens = max(1, round(settings.chunk_sec * 25))
@@ -126,25 +607,140 @@ def prepare_stream_context(
     audio_declick_samples = align_audio_declick_samples(settings.audio_declick_ms, model.sample_rate)
     max_audio_blend_samples = align_audio_blend_samples(settings.audio_blend_ms, model.sample_rate)
     flow_streaming = settings.flow_context == "streaming"
-    use_prompt_kv_cache = flow_streaming and not settings.disable_prompt_kv_cache
+    prompt_cache_requested = flow_streaming and not settings.disable_prompt_kv_cache
+    use_prompt_kv_cache = prompt_cache_requested
+
+    prompt_prepare_start = time.perf_counter()
+    prompt_source_kind = "legacy_wav"
+    voice_package_metadata = None
+    selected_branch_index = None
+    voice_inputs = None
+    if isinstance(prompt_source, VoicePromptInputs):
+        voice_inputs = prompt_source
+        prompt_token, prompt_feat, embedding, selected_branch_index = select_runtime_prompt_inputs(voice_inputs)
+        voice_package_metadata = voice_inputs.metadata
+        prompt_source_kind = "voice_package"
+    else:
+        prompt_path = Path(prompt_source).expanduser()
+        if prompt_path.suffix.lower() == ".cvvoice":
+            voice_inputs = prepare_prompt_inputs_from_package(model, prompt_path)
+            prompt_token, prompt_feat, embedding, selected_branch_index = select_runtime_prompt_inputs(voice_inputs)
+            voice_package_metadata = voice_inputs.metadata
+            prompt_source_kind = "voice_package"
+        else:
+            prompt_token, prompt_feat, embedding = prepare_prompt_inputs_from_wav(model, prompt_path)
+    prompt_cache_disabled_reason = None
+    prompt_cache_notes: list[str] = []
+    cache_storage_dtype = prompt_cache_storage_dtype(model, settings.prompt_cache_dtype)
+    cache_storage_dtype_bytes = prompt_cache_dtype_bytes(cache_storage_dtype)
+    offload_prompt_kv = prompt_cache_offload_kv_to_cpu(settings.prompt_cache_storage)
+    if cache_storage_dtype is not None:
+        prompt_cache_notes.append(f"prompt KV storage dtype={str(cache_storage_dtype).replace('torch.', '')}")
+    if offload_prompt_kv:
+        prompt_cache_notes.append("prompt KV storage offloaded to CPU")
+    active_branch_count = len(voice_inputs.active_branch_indices()) if voice_inputs is not None else 1
+    use_grouped_prompt = (
+        voice_inputs is not None
+        and len(voice_inputs.branches) > 1
+        and active_branch_count > 1
+        and grouped_prompt_enabled(settings.enable_grouped_prompt)
+    )
+    grouped_prompt_inputs = prepare_grouped_prompt_runtime_inputs(voice_inputs) if use_grouped_prompt and voice_inputs is not None else None
+    grouped_cache_mel_frames = None
+    use_grouped_prompt_cache = (
+        use_grouped_prompt
+        and prompt_cache_requested
+        and grouped_prompt_cache_enabled(settings.enable_grouped_prompt_cache)
+    )
+
+    if use_grouped_prompt and prompt_cache_requested and not use_grouped_prompt_cache:
+        prompt_cache_notes.append(
+            "grouped prompt is enabled without grouped prompt KV cache; grouped attention will be recomputed per window"
+        )
+
+    if use_grouped_prompt_cache and voice_inputs is not None:
+        branch_frames = [voice_inputs.branches[index].prompt_feat.shape[1] for index in voice_inputs.active_branch_indices()]
+        unaligned_branch = next(
+            (
+                frames
+                for frames in branch_frames
+                if trim_cache_mel_frames_to_static(model, frames) != frames
+            ),
+            None,
+        )
+        if unaligned_branch is not None:
+            grouped_cache_mel_frames = 0
+            budget_note = (
+                "grouped prompt KV cache disabled because at least one full prompt branch is not aligned "
+                "to the DiT static cache grid; running without cache preserves prompt quality"
+            )
+        else:
+            grouped_cache_mel_frames, budget_note = choose_full_prompt_cache_frames(
+                model,
+                max(branch_frames, default=0),
+                branch_count=len(branch_frames),
+                dtype_bytes=cache_storage_dtype_bytes,
+                max_mb=settings.prompt_cache_max_mb,
+                max_seconds=settings.prompt_cache_max_seconds,
+            )
+        if grouped_cache_mel_frames <= 0:
+            use_grouped_prompt_cache = False
+            use_prompt_kv_cache = False
+            prompt_cache_notes.append(
+                (budget_note or "grouped prompt KV cache does not fit the configured memory budget")
+                + "; keeping grouped prompt quality path without cache"
+            )
+        else:
+            if budget_note:
+                prompt_cache_notes.append(budget_note)
+    elif use_grouped_prompt:
+        use_prompt_kv_cache = False
+
+    if use_prompt_kv_cache and not use_grouped_prompt:
+        cache_mel_frames, budget_note = choose_full_prompt_cache_frames(
+            model,
+            prompt_feat.shape[1],
+            dtype_bytes=cache_storage_dtype_bytes,
+            max_mb=settings.prompt_cache_max_mb,
+            max_seconds=settings.prompt_cache_max_seconds,
+        )
+        if cache_mel_frames <= 0:
+            use_prompt_kv_cache = False
+            prompt_cache_notes.append(budget_note or "prompt KV cache does not fit the configured memory budget")
+        elif budget_note:
+            prompt_cache_notes.append(budget_note)
+    if prompt_cache_disabled_reason is None and prompt_cache_notes:
+        prompt_cache_disabled_reason = "; ".join(prompt_cache_notes)
+
     history_cache_enabled = (
         flow_streaming
         and not settings.disable_history_kv_cache
         and use_prompt_kv_cache
+        and not use_grouped_prompt_cache
+        and not use_grouped_prompt
         and is_static_cache_aligned(history_tokens, model)
     )
-
-    prompt_prepare_start = time.perf_counter()
-    prompt_token, prompt_feat, embedding = prepare_prompt_inputs(model, prompt_wav)
-    if use_prompt_kv_cache:
-        prompt_token, prompt_feat = trim_prompt_to_static_cache(prompt_token, prompt_feat, model)
     sync_device(model.device)
     prompt_prepare_seconds = time.perf_counter() - prompt_prepare_start
 
     prompt_cache_len = 0
     prompt_cache_steps = None
     prompt_cache_prepare_seconds = 0.0
-    if use_prompt_kv_cache:
+    if use_grouped_prompt_cache and voice_inputs is not None:
+        cache_start = time.perf_counter()
+        prompt_token, prompt_feat, embedding, selected_branch_index, prompt_cache_len, prompt_cache_steps = (
+            prepare_grouped_prompt_cache(
+                model,
+                voice_inputs,
+                flow_streaming,
+                max_cache_mel_frames=grouped_cache_mel_frames,
+                cache_storage_dtype=cache_storage_dtype,
+                offload_kv_to_cpu=offload_prompt_kv,
+            )
+        )
+        sync_device(model.device)
+        prompt_cache_prepare_seconds = time.perf_counter() - cache_start
+    elif use_prompt_kv_cache:
         cache_start = time.perf_counter()
         prompt_token_len = torch.tensor([prompt_token.shape[1]], dtype=torch.int32, device=model.device)
         prompt_feat_len = torch.tensor([prompt_feat.shape[1]], dtype=torch.int32, device=model.device)
@@ -155,6 +751,11 @@ def prepare_stream_context(
             prompt_feat_len=prompt_feat_len,
             embedding=embedding,
             streaming=flow_streaming,
+        )
+        optimize_prompt_cache_storage(
+            prompt_cache_steps,
+            cache_storage_dtype,
+            offload_kv_to_cpu=offload_prompt_kv,
         )
         sync_device(model.device)
         prompt_cache_prepare_seconds = time.perf_counter() - cache_start
@@ -177,6 +778,13 @@ def prepare_stream_context(
         prompt_cache_steps=prompt_cache_steps,
         prompt_prepare_seconds=prompt_prepare_seconds,
         prompt_cache_prepare_seconds=prompt_cache_prepare_seconds,
+        prompt_source_kind=prompt_source_kind,
+        voice_package_metadata=voice_package_metadata,
+        selected_branch_index=selected_branch_index,
+        prompt_cache_disabled_reason=prompt_cache_disabled_reason,
+        grouped_prompt_inputs=grouped_prompt_inputs,
+        use_grouped_prompt=use_grouped_prompt,
+        use_grouped_prompt_cache=use_grouped_prompt_cache,
     )
 
 
@@ -185,11 +793,18 @@ def stream_context_log_lines(
     settings: StreamSettings,
     context: PreparedStreamContext,
 ) -> list[str]:
-    return [
+    lines = [
         f"device={model.device}",
         f"flow_context={settings.flow_context}",
         f"hift_mode={settings.hift_mode}",
+        f"prompt_source={context.prompt_source_kind}",
         f"prompt_kv_cache={context.use_prompt_kv_cache}",
+        f"prompt_cache_max_mb={settings.prompt_cache_max_mb:g}",
+        f"prompt_cache_max_seconds={settings.prompt_cache_max_seconds:g}",
+        f"prompt_cache_dtype={settings.prompt_cache_dtype}",
+        f"prompt_cache_storage={settings.prompt_cache_storage}",
+        f"grouped_prompt={context.use_grouped_prompt}",
+        f"grouped_prompt_cache={context.use_grouped_prompt_cache}",
         f"history_kv_cache={context.use_history_kv_cache}",
         f"prompt_tokens={context.prompt_token.shape[1]} prompt_seconds={context.prompt_token.shape[1] / 25.0:.3f}",
         f"prompt_cache_mel={context.prompt_cache_len} prompt_cache_seconds={context.prompt_cache_len / 50.0:.3f}",
@@ -210,6 +825,28 @@ def stream_context_log_lines(
         f"prompt_prepare_seconds={context.prompt_prepare_seconds:.3f}",
         f"prompt_cache_prepare_seconds={context.prompt_cache_prepare_seconds:.3f}",
     ]
+    if context.prompt_cache_disabled_reason:
+        lines.append(f"prompt_cache_disabled_reason={context.prompt_cache_disabled_reason}")
+    if context.voice_package_metadata is not None:
+        metadata = context.voice_package_metadata
+        runtime_policy = "dominant_branch_prompt_with_fused_embedding"
+        if context.use_grouped_prompt:
+            runtime_policy = "grouped_branch_attention_output_mix"
+            if context.use_grouped_prompt_cache:
+                runtime_policy += "_cached"
+            else:
+                runtime_policy += "_uncached"
+        lines.extend(
+            [
+                f"voice_package_id={metadata.get('package_id')}",
+                f"voice_package_branch_count={metadata.get('branch_count')}",
+                f"voice_package_selected_branch={context.selected_branch_index}",
+                f"voice_package_fusion_mode={metadata.get('fusion_mode')}",
+                f"voice_package_prompt_fusion={metadata.get('prompt_fusion_algorithm')}",
+                f"voice_package_runtime_prompt_policy={runtime_policy}",
+            ]
+        )
+    return lines
 
 
 def offline_summary_lines(
@@ -975,6 +1612,7 @@ def run_window_stream(
     use_history_kv_cache: bool,
     prompt_cache_len: int,
     prompt_cache_steps,
+    grouped_prompt_inputs: dict[str, Any] | None = None,
     on_audio_chunk: Callable[[torch.Tensor, dict], None] | None = None,
     log_fn: Callable[[str], None] | None = print,
     stop_event: threading.Event | None = None,
@@ -1057,6 +1695,7 @@ def run_window_stream(
             use_prompt_cache=use_prompt_kv_cache,
             prompt_cache_len=active_cache_len,
             prompt_cache_steps=active_cache_steps,
+            grouped_prompt_inputs=grouped_prompt_inputs,
             source_cache_len=source_cache_len,
             source_cache_end=source_cache_end,
             source_mel_offset=source_mel_offset,
@@ -1233,6 +1872,7 @@ def infer_flow_window(
     use_prompt_cache: bool,
     prompt_cache_len: int,
     prompt_cache_steps,
+    grouped_prompt_inputs: dict[str, Any] | None,
     source_cache_len: int,
     source_cache_end: int,
     source_mel_offset: int,
@@ -1254,6 +1894,7 @@ def infer_flow_window(
             use_prompt_cache=use_prompt_cache,
             prompt_cache_len=prompt_cache_len,
             prompt_cache_steps=prompt_cache_steps,
+            grouped_prompt_inputs=grouped_prompt_inputs,
             source_cache_len=source_cache_len,
             source_cache_end=source_cache_end,
             source_mel_offset=source_mel_offset,
@@ -1467,6 +2108,270 @@ def _noop_metrics(row: dict, player_stats: dict | None = None) -> None:
     pass
 
 
+def create_voice_package(
+    model: VCOnlyModel,
+    prompt_wavs: list[str | Path],
+    output_path: str | Path,
+    options: MappingLike | None = None,
+    status_fn: Callable[[str], None] | None = None,
+    log_fn: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    status_fn = status_fn or _noop_status
+    log_fn = log_fn or _noop_log
+    options_dict = dict(options or {})
+    prompt_paths = [Path(path).expanduser() for path in prompt_wavs]
+    if not prompt_paths:
+        raise ValueError("at least one reference WAV is required")
+
+    fusion_mode = str(options_dict.get("fusion_mode", "equal_weight"))
+    if fusion_mode not in {"equal_weight", "duration_weight", "manual_weight"}:
+        raise ValueError("fusion_mode must be equal_weight, duration_weight, or manual_weight")
+    manual_weights = list(options_dict.get("manual_weights", []))
+    branch_weight_gamma = float(options_dict.get("branch_weight_gamma", 1.0))
+    attention_temperature = float(options_dict.get("attention_temperature", 1.0))
+    canonical_prompt_length_seconds = float(options_dict.get("canonical_prompt_length_seconds", 10.0))
+    skip_unreadable = bool(options_dict.get("skip_unreadable", False))
+    if branch_weight_gamma <= 0:
+        raise ValueError("branch_weight_gamma must be greater than 0")
+    if attention_temperature <= 0:
+        raise ValueError("attention_temperature must be greater than 0")
+    if canonical_prompt_length_seconds <= 0:
+        raise ValueError("canonical_prompt_length_seconds must be greater than 0")
+
+    accepted: list[dict[str, Any]] = []
+    total_reference_seconds = 0.0
+    for source_index, path in enumerate(prompt_paths):
+        status_fn(f"Preparing reference {source_index + 1}/{len(prompt_paths)}...")
+        try:
+            source = _prepare_voice_reference(model, path, source_index, log_fn=log_fn)
+        except Exception as error:
+            if skip_unreadable:
+                log_fn(f"Skipping unreadable reference {path}: {error}")
+                continue
+            raise
+        total_reference_seconds += float(source["duration_seconds"])
+        accepted.append(source)
+
+    if not accepted:
+        raise ValueError("no reference WAV files were accepted")
+
+    raw_weights = _resolve_raw_fusion_weights(accepted, fusion_mode, manual_weights)
+    positive_sum = sum(weight for weight in raw_weights if weight > 0)
+    if positive_sum <= 0:
+        raise ValueError("at least one accepted reference must have a positive fusion weight")
+    normalized_weights = [weight / positive_sum if weight > 0 else 0.0 for weight in raw_weights]
+    sharpened_weights = sharpen_weights(normalized_weights, branch_weight_gamma)
+
+    tensors: dict[str, np.ndarray] = {}
+    prompt_sources = []
+    normalized_embeddings = []
+    for branch_index, source in enumerate(accepted):
+        embedding = source["embedding"]
+        normalized_embedding = l2_normalize_array(embedding)
+        normalized_embeddings.append(normalized_embedding)
+        speaker_key, token_key, feat_key = (
+            f"branch_{branch_index}_speaker_embedding",
+            f"branch_{branch_index}_prompt_token",
+            f"branch_{branch_index}_prompt_feat",
+        )
+        tensors[speaker_key] = normalized_embedding.astype(np.float32)
+        tensors[token_key] = source["prompt_token"].astype(np.int32)
+        tensors[feat_key] = source["prompt_feat"].astype(np.float32)
+        source_metadata = {
+            "source_index": int(source["source_index"]),
+            "branch_index": branch_index,
+            "display_name": str(options_dict.get("display_name") or source["path"].stem),
+            "path_basename": source["path"].name,
+            "file_sha256": source["file_sha256"],
+            "original_sample_rate": int(source["original_sample_rate"]),
+            "duration_seconds": float(source["duration_seconds"]),
+            "accepted_seconds": float(source["accepted_seconds"]),
+            "token_frames": int(source["prompt_token"].shape[1]),
+            "mel_frames": int(source["prompt_feat"].shape[1]),
+            "embedding_norm": float(source["embedding_norm"]),
+            "fusion_weight_raw": float(raw_weights[branch_index]),
+            "fusion_weight_normalized": float(normalized_weights[branch_index]),
+            "branch_weight_after_gamma": float(sharpened_weights[branch_index]),
+            "is_masked": bool(normalized_weights[branch_index] <= 0.0),
+        }
+        prompt_sources.append(source_metadata)
+        log_fn(
+            "reference branch={branch} seconds={seconds:.3f} tokens={tokens} mel_frames={mel} "
+            "raw_weight={raw:.4f} normalized_weight={norm:.4f} masked={masked}".format(
+                branch=branch_index,
+                seconds=source_metadata["accepted_seconds"],
+                tokens=source_metadata["token_frames"],
+                mel=source_metadata["mel_frames"],
+                raw=source_metadata["fusion_weight_raw"],
+                norm=source_metadata["fusion_weight_normalized"],
+                masked=source_metadata["is_masked"],
+            )
+        )
+
+    fused_embedding = _fuse_speaker_embeddings(normalized_embeddings, normalized_weights)
+    tensors["fused_speaker_embedding"] = fused_embedding.astype(np.float32)
+    accepted_reference_seconds = sum(float(source["accepted_seconds"]) for source in accepted)
+    prompt_token_frames = sum(int(source["prompt_token"].shape[1]) for source in accepted)
+    prompt_mel_frames = sum(int(source["prompt_feat"].shape[1]) for source in accepted)
+    metadata = {
+        "format_name": FORMAT_NAME,
+        "format_version": FORMAT_VERSION,
+        "package_id": str(options_dict.get("package_id") or new_package_id()),
+        "created_at": str(options_dict.get("created_at") or utc_now_iso()),
+        "created_by": str(options_dict.get("created_by") or "vc_studio"),
+        "app_version": APP_VERSION,
+        "model_family": MODEL_FAMILY,
+        "model_dir_name": Path(model.model_dir).name,
+        **model_compatibility_fields(model),
+        "branch_count": len(accepted),
+        "prompt_seconds": float(accepted_reference_seconds),
+        "prompt_token_frames": int(prompt_token_frames),
+        "prompt_mel_frames": int(prompt_mel_frames),
+        "fused_speaker_embedding_norm": float(np.linalg.norm(fused_embedding)),
+        "tensor_sha256": "",
+        "reference_count": len(accepted),
+        "total_reference_seconds": float(total_reference_seconds),
+        "accepted_reference_seconds": float(accepted_reference_seconds),
+        "prompt_sources": prompt_sources,
+        "fusion_mode": fusion_mode,
+        "speaker_embedding_fusion_algorithm": "l2_normalize_each_then_weighted_average_then_l2_normalize",
+        "prompt_fusion_algorithm": "grouped_branch_attention_output_mix",
+        "experimental_prompt_fusion_algorithms": [
+            "concat_branch_prompt_kv_with_attention_logit_bias",
+            "concat_branch_prompt_kv_with_value_scaling",
+        ],
+        "fusion_weight_sum_raw": float(positive_sum),
+        "fusion_weight_normalization": "divide_by_sum_of_positive_raw_weights",
+        "attention_weight_zero_policy": "mask_branch",
+        "branch_weight_gamma": float(branch_weight_gamma),
+        "attention_temperature": float(attention_temperature),
+        "single_speaker_package": True,
+        "source_position_policy": "canonical_prompt_length",
+        "canonical_prompt_length_seconds": float(canonical_prompt_length_seconds),
+        "canonical_prompt_length_mel_frames": int(round(canonical_prompt_length_seconds * TOKEN_RATE * TOKEN_MEL_RATIO)),
+        "prompt_length_normalization_policy": "reject_over_limit_until_vad_segmentation",
+        "flow_token_tail_fusion_policy": "dominant_branch",
+        "dominant_branch_tie_breaker": "lowest_branch_index",
+        "sample_rate": SAMPLE_RATE,
+        "tokenizer_sample_rate": TOKENIZER_SAMPLE_RATE,
+        "token_rate": TOKEN_RATE,
+        "token_mel_ratio": TOKEN_MEL_RATIO,
+        "speaker_embedding_dim": SPEAKER_EMBEDDING_DIM,
+        "mel_bins": MEL_BINS,
+        "feature_dtype": "float32",
+    }
+    for optional_key in (
+        "display_name",
+        "author",
+        "license",
+        "tags",
+        "short_description",
+        "long_description",
+        "quality_notes",
+        "privacy_notes",
+    ):
+        if optional_key in options_dict:
+            metadata[optional_key] = options_dict[optional_key]
+
+    status_fn("Saving voice package...")
+    final_metadata = save_voice_package(
+        output_path,
+        tensors=tensors,
+        metadata=metadata,
+        portrait_path=options_dict.get("portrait_path") or None,
+    )
+    log_fn(f"voice_package={Path(output_path).expanduser().resolve()}")
+    log_fn(f"voice_package_branches={final_metadata['branch_count']} tensor_sha256={final_metadata['tensor_sha256']}")
+    status_fn("Voice package created.")
+    return final_metadata
+
+
+def _prepare_voice_reference(
+    model: VCOnlyModel,
+    path: Path,
+    source_index: int,
+    log_fn: Callable[[str], None],
+) -> dict[str, Any]:
+    if not path.is_file():
+        raise FileNotFoundError(f"reference WAV does not exist: {path}")
+    try:
+        info = sf.info(str(path))
+    except Exception as error:
+        raise ValueError(f"unsupported or unreadable audio file: {path}") from error
+    if info.frames <= 0 or info.samplerate <= 0:
+        raise ValueError(f"reference WAV is empty: {path}")
+    duration_seconds = float(info.frames) / float(info.samplerate)
+    if duration_seconds <= 0:
+        raise ValueError(f"reference WAV is empty: {path}")
+    if duration_seconds > TOKENIZER_SAFE_SECONDS:
+        raise ValueError(
+            f"reference WAV is {duration_seconds:.2f}s, but tokenizer-safe package creation is limited "
+            f"to {TOKENIZER_SAFE_SECONDS:.0f}s until VAD segmentation is implemented: {path}"
+        )
+
+    wav_16k = read_mono(path, TOKENIZER_SAMPLE_RATE)
+    wav_24k = read_mono(path, SAMPLE_RATE)
+    if wav_16k.numel() == 0 or wav_24k.numel() == 0:
+        raise ValueError(f"reference WAV is empty after decoding: {path}")
+
+    token = model.features.speech_token(wav_16k).to(dtype=torch.int32).cpu()
+    if token.shape[1] <= 0:
+        raise ValueError(f"reference WAV produced zero speech tokens: {path}")
+    feat = mel_spectrogram_24000(wav_24k).squeeze(0).transpose(0, 1).unsqueeze(0).to(dtype=torch.float32).cpu()
+    token, feat = align_prompt_token_feat(token, feat, model.token_mel_ratio)
+    embedding = model.features.speaker_embedding(wav_16k).to(dtype=torch.float32).cpu().numpy()
+    embedding_norm = float(np.linalg.norm(embedding))
+    log_fn(
+        f"accepted reference index={source_index} file={path.name} duration={duration_seconds:.3f}s "
+        f"tokens={token.shape[1]} mel_frames={feat.shape[1]} embedding_norm={embedding_norm:.6f}"
+    )
+    return {
+        "source_index": source_index,
+        "path": path,
+        "file_sha256": sha256_file(path),
+        "original_sample_rate": int(info.samplerate),
+        "duration_seconds": duration_seconds,
+        "accepted_seconds": float(token.shape[1]) / TOKEN_RATE,
+        "prompt_token": token.numpy().astype(np.int32),
+        "prompt_feat": feat.numpy().astype(np.float32),
+        "embedding": embedding.astype(np.float32),
+        "embedding_norm": embedding_norm,
+    }
+
+
+def _resolve_raw_fusion_weights(
+    accepted: list[dict[str, Any]],
+    fusion_mode: str,
+    manual_weights: list[Any],
+) -> list[float]:
+    weights = []
+    for source in accepted:
+        if fusion_mode == "equal_weight":
+            weight = 1.0
+        elif fusion_mode == "duration_weight":
+            weight = float(source["accepted_seconds"])
+        else:
+            source_index = int(source["source_index"])
+            if source_index >= len(manual_weights):
+                raise ValueError("manual fusion requires one non-negative raw weight per reference")
+            weight = float(manual_weights[source_index])
+            if weight < 0:
+                raise ValueError("manual fusion weights must be non-negative")
+        weights.append(float(weight))
+    return weights
+
+
+def _fuse_speaker_embeddings(normalized_embeddings: list[np.ndarray], weights: list[float]) -> np.ndarray:
+    fused = np.zeros_like(normalized_embeddings[0], dtype=np.float32)
+    for embedding, weight in zip(normalized_embeddings, weights):
+        if weight > 0:
+            fused += embedding.astype(np.float32) * float(weight)
+    return l2_normalize_array(fused).astype(np.float32)
+
+
+MappingLike = Mapping[str, Any]
+
+
 class VCStudioBackend:
     def __init__(self) -> None:
         self._model_lock = threading.Lock()
@@ -1491,8 +2396,8 @@ class VCStudioBackend:
 
         status_fn("Loading model...")
         model = self.get_model(config, log_fn=log_fn)
-        status_fn("Preparing prompt...")
-        context = prepare_stream_context(model, config.prompt, config.settings)
+        status_fn("Preparing voice package..." if config.voice_package else "Preparing prompt...")
+        context = prepare_stream_context(model, config.voice_package or config.prompt, config.settings)
         for line in stream_context_log_lines(model, config.settings, context):
             log_fn(line)
         status_fn("Loading Silero VAD..." if config.settings.vad_enabled else "Preparing source...")
@@ -1525,6 +2430,7 @@ class VCStudioBackend:
                 use_history_kv_cache=context.use_history_kv_cache,
                 prompt_cache_len=context.prompt_cache_len,
                 prompt_cache_steps=context.prompt_cache_steps,
+                grouped_prompt_inputs=context.grouped_prompt_inputs,
                 log_fn=log_fn,
                 stop_event=stop_event,
                 on_audio_chunk=lambda speech_chunk, row: metrics_fn(row, None),
@@ -1558,8 +2464,8 @@ class VCStudioBackend:
         try:
             status_fn("Loading model...")
             model = self.get_model(config, log_fn=log_fn)
-            status_fn("Preparing prompt...")
-            context = prepare_stream_context(model, config.prompt, config.settings)
+            status_fn("Preparing voice package..." if config.voice_package else "Preparing prompt...")
+            context = prepare_stream_context(model, config.voice_package or config.prompt, config.settings)
             for line in stream_context_log_lines(model, config.settings, context):
                 log_fn(line)
             status_fn("Loading Silero VAD..." if config.settings.vad_enabled else "Opening audio output...")
@@ -1608,6 +2514,7 @@ class VCStudioBackend:
                 use_history_kv_cache=context.use_history_kv_cache,
                 prompt_cache_len=context.prompt_cache_len,
                 prompt_cache_steps=context.prompt_cache_steps,
+                grouped_prompt_inputs=context.grouped_prompt_inputs,
                 on_audio_chunk=handle_chunk,
                 log_fn=log_fn,
                 stop_event=stop_event,
@@ -1629,6 +2536,30 @@ class VCStudioBackend:
                     self._live_source = None
                 if self._live_player is player:
                     self._live_player = None
+
+    def create_voice_package(
+        self,
+        config: BackendConfig,
+        prompt_wavs: list[str | Path],
+        output_path: str | Path,
+        options: Mapping[str, Any] | None = None,
+        *,
+        status_fn: Callable[[str], None] | None = None,
+        log_fn: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        status_fn = status_fn or _noop_status
+        log_fn = log_fn or _noop_log
+        status_fn("Loading model...")
+        model = self.get_model(config, log_fn=log_fn)
+        status_fn("Creating voice package...")
+        return create_voice_package(
+            model,
+            prompt_wavs=prompt_wavs,
+            output_path=output_path,
+            options=options,
+            status_fn=status_fn,
+            log_fn=log_fn,
+        )
 
     def stop_realtime(self) -> None:
         with self._live_lock:

@@ -243,6 +243,7 @@ class CausalConditionalCFM(ConditionalCFM):
         prompt_len=0,
         use_prompt_cache=False,
         prompt_cache_steps=None,
+        grouped_prompt_uncached=None,
         source_cache_len=0,
         source_cache_end=0,
         source_mel_offset=0,
@@ -277,6 +278,21 @@ class CausalConditionalCFM(ConditionalCFM):
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
         if self.t_scheduler == 'cosine':
             t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
+        if grouped_prompt_uncached is not None:
+            grouped_prompt_uncached = dict(grouped_prompt_uncached)
+            grouped_prompt_uncached["temperature"] = temperature
+            return self.solve_euler_grouped_prompt_uncached(
+                z,
+                t_span=t_span,
+                mu=mu,
+                mask=mask,
+                spks=spks,
+                cond=cond,
+                prompt_len=prompt_len,
+                grouped_prompt=grouped_prompt_uncached,
+                source_mel_offset=source_mel_offset,
+                streaming=streaming,
+            ), None
         if prompt_cache_steps is not None:
             return self.solve_euler_prepared_prompt_cache(
                 z,
@@ -495,7 +511,8 @@ class CausalConditionalCFM(ConditionalCFM):
             if step < len(t_span) - 1:
                 dt = t_span[step + 1] - t
 
-        sample = torch.cat([prompt_cache_steps["final_prompt_x"], source_x], dim=2).float()
+        final_prompt_x = prompt_cache_steps["final_prompt_x"].to(device=source_x.device, dtype=source_x.dtype)
+        sample = torch.cat([final_prompt_x, source_x], dim=2).float()
         updated_cache = None
         if collect_source_cache:
             updated_cache = self.build_bounded_source_cache(
@@ -506,6 +523,85 @@ class CausalConditionalCFM(ConditionalCFM):
                 source_cache_end=source_cache_end,
             )
         return sample, updated_cache
+
+    def solve_euler_grouped_prompt_uncached(
+        self,
+        x,
+        t_span,
+        mu,
+        mask,
+        spks,
+        cond,
+        prompt_len,
+        grouped_prompt,
+        source_mel_offset=0,
+        streaming=False,
+    ):
+        if prompt_len <= 0:
+            return self.solve_euler(
+                x,
+                t_span=t_span,
+                mu=mu,
+                mask=mask,
+                spks=spks,
+                cond=cond,
+                streaming=streaming,
+                prompt_len=prompt_len,
+                source_mel_offset=source_mel_offset,
+            )
+
+        branch_mus = grouped_prompt["branch_mus"]
+        branch_conds = grouped_prompt["branch_conds"]
+        branch_spks = grouped_prompt["branch_spks"]
+        branch_weights = grouped_prompt["branch_weights"]
+        dominant_position = int(grouped_prompt.get("dominant_branch_position", 0))
+        attention_temperature = float(grouped_prompt.get("attention_temperature", 1.0))
+        temperature = float(grouped_prompt.get("temperature", 1.0))
+        if not isinstance(self.estimator, torch.nn.Module) or not hasattr(self.estimator, "forward_grouped_prompt_source_uncached"):
+            raise RuntimeError("uncached grouped prompt attention requires the PyTorch DiT estimator")
+
+        t, _, dt = t_span[0], t_span[-1], t_span[1] - t_span[0]
+        t = t.unsqueeze(dim=0)
+        source_x = x[:, :, prompt_len:]
+        source_mu = mu[:, :, prompt_len:]
+        source_cond = cond[:, :, prompt_len:]
+        branch_prompt_x = [
+            self.noise_slice(0, branch_mu.shape[2], device=x.device, dtype=x.dtype) * temperature
+            for branch_mu in branch_mus
+        ]
+
+        for step in range(1, len(t_span)):
+            prompt_outs, source_dphi = self.estimator.forward_grouped_prompt_source_uncached(
+                branch_prompt_x=[prompt_x.to(device=x.device, dtype=spks.dtype) for prompt_x in branch_prompt_x],
+                branch_prompt_mu=[branch_mu.to(device=x.device, dtype=spks.dtype) for branch_mu in branch_mus],
+                branch_prompt_cond=[branch_cond.to(device=x.device, dtype=spks.dtype) for branch_cond in branch_conds],
+                branch_spks=[branch_spk.to(device=x.device, dtype=spks.dtype) for branch_spk in branch_spks],
+                source_x=source_x,
+                source_mu=source_mu,
+                t=t,
+                source_spks=spks,
+                source_cond=source_cond,
+                branch_weights=branch_weights,
+                dominant_branch_position=dominant_position,
+                streaming=streaming,
+                source_mel_offset=source_mel_offset,
+                attention_temperature=attention_temperature,
+            )
+            next_branch_prompt_x = []
+            for prompt_x, prompt_out in zip(branch_prompt_x, prompt_outs):
+                prompt_dphi, prompt_cfg_dphi = torch.split(prompt_out, [prompt_x.size(0), prompt_x.size(0)], dim=0)
+                prompt_dphi = ((1.0 + self.inference_cfg_rate) * prompt_dphi - self.inference_cfg_rate * prompt_cfg_dphi)
+                next_branch_prompt_x.append(prompt_x + dt * prompt_dphi)
+            source_dphi, source_cfg_dphi = torch.split(source_dphi, [x.size(0), x.size(0)], dim=0)
+            source_dphi = ((1.0 + self.inference_cfg_rate) * source_dphi - self.inference_cfg_rate * source_cfg_dphi)
+            source_x = source_x + dt * source_dphi
+            branch_prompt_x = next_branch_prompt_x
+            t = t + dt
+            if step < len(t_span) - 1:
+                dt = t_span[step + 1] - t
+
+        final_prompt_x = branch_prompt_x[dominant_position]
+        return torch.cat([final_prompt_x, source_x], dim=2).float()
 
     def build_bounded_source_cache(
         self,

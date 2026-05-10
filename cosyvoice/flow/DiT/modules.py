@@ -436,6 +436,91 @@ class Attention(nn.Module):
         x = self.to_out[1](x)
         return x
 
+    def attend_grouped_prompt_projected(
+        self,
+        query: torch.Tensor,
+        source_key: torch.Tensor,
+        source_value: torch.Tensor,
+        prompt_key: torch.Tensor,
+        prompt_value: torch.Tensor,
+        prompt_mask: torch.Tensor,
+        branch_weights: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        attention_temperature: float = 1.0,
+    ) -> torch.Tensor:
+        prompt_key = prompt_key.to(device=query.device, dtype=query.dtype)
+        prompt_value = prompt_value.to(device=query.device, dtype=query.dtype)
+        prompt_mask = prompt_mask.to(device=query.device)
+        branch_weights = branch_weights.to(device=query.device, dtype=query.dtype)
+        branch_count, batch_size, heads, prompt_len, head_dim = prompt_key.shape
+        source_len = query.shape[2]
+        query = query.unsqueeze(0).expand(branch_count, -1, -1, -1, -1)
+        source_key = source_key.unsqueeze(0).expand(branch_count, -1, -1, -1, -1)
+        source_value = source_value.unsqueeze(0).expand(branch_count, -1, -1, -1, -1)
+
+        query = query.reshape(branch_count * batch_size, heads, source_len, head_dim)
+        source_key = source_key.reshape(branch_count * batch_size, heads, source_len, head_dim)
+        source_value = source_value.reshape(branch_count * batch_size, heads, source_len, head_dim)
+        prompt_key = prompt_key.reshape(branch_count * batch_size, heads, prompt_len, head_dim)
+        prompt_value = prompt_value.reshape(branch_count * batch_size, heads, prompt_len, head_dim)
+        if attention_temperature != 1.0:
+            query = query / float(attention_temperature)
+
+        key = torch.cat([prompt_key, source_key], dim=2)
+        value = torch.cat([prompt_value, source_value], dim=2)
+        attn_mask = self._grouped_prompt_attention_mask(
+            prompt_mask=prompt_mask,
+            source_mask=mask,
+            branch_count=branch_count,
+            batch_size=batch_size,
+            source_len=source_len,
+            prompt_len=prompt_len,
+        )
+        x = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
+        x = x.transpose(1, 2).reshape(branch_count * batch_size, source_len, heads * head_dim)
+        x = x.to(query.dtype)
+        x = self.to_out[0](x)
+        x = self.to_out[1](x)
+        x = x.view(branch_count, batch_size, source_len, -1)
+        weights = branch_weights.to(device=x.device, dtype=x.dtype).view(branch_count, 1, 1, 1)
+        return torch.sum(x * weights, dim=0)
+
+    def _grouped_prompt_attention_mask(
+        self,
+        prompt_mask: torch.Tensor,
+        source_mask: torch.Tensor | None,
+        branch_count: int,
+        batch_size: int,
+        source_len: int,
+        prompt_len: int,
+    ) -> torch.Tensor | None:
+        prompt_attn_mask = prompt_mask[:, None, None, None, :].expand(
+            branch_count,
+            batch_size,
+            1,
+            source_len,
+            prompt_len,
+        )
+        if source_mask is None:
+            source_attn_mask = torch.ones(
+                branch_count,
+                batch_size,
+                1,
+                source_len,
+                source_len,
+                dtype=torch.bool,
+                device=prompt_mask.device,
+            )
+        else:
+            source_attn_mask = source_mask[:, :, :, -source_len:]
+            source_attn_mask = source_attn_mask.unsqueeze(0).expand(branch_count, -1, -1, -1, -1)
+        return torch.cat([prompt_attn_mask, source_attn_mask], dim=-1).reshape(
+            branch_count * batch_size,
+            1,
+            source_len,
+            prompt_len + source_len,
+        )
+
 
 # Attention processor
 
@@ -639,9 +724,48 @@ class DiTBlock(nn.Module):
     def forward_with_prompt_kv(self, x, t, prompt_key, prompt_value, mask=None, rope=None, return_kv=False):
         norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(x, emb=t)
         query, source_key, source_value = self.attn.project_qkv(norm, rope=rope)
+        prompt_key = prompt_key.to(device=source_key.device, dtype=source_key.dtype)
+        prompt_value = prompt_value.to(device=source_value.device, dtype=source_value.dtype)
         key = torch.cat([prompt_key, source_key], dim=2)
         value = torch.cat([prompt_value, source_value], dim=2)
         attn_output = self.attn.attend_projected(query, key, value, mask=mask)
+
+        x = x + gate_msa.unsqueeze(1) * attn_output
+
+        ff_norm = self.ff_norm(x) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        ff_output = self.ff(ff_norm)
+        x = x + gate_mlp.unsqueeze(1) * ff_output
+
+        if return_kv:
+            return x, source_key, source_value
+        return x
+
+    def forward_with_grouped_prompt_kv(
+        self,
+        x,
+        t,
+        prompt_key,
+        prompt_value,
+        prompt_mask,
+        branch_weights,
+        mask=None,
+        rope=None,
+        return_kv=False,
+        attention_temperature=1.0,
+    ):
+        norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(x, emb=t)
+        query, source_key, source_value = self.attn.project_qkv(norm, rope=rope)
+        attn_output = self.attn.attend_grouped_prompt_projected(
+            query=query,
+            source_key=source_key,
+            source_value=source_value,
+            prompt_key=prompt_key,
+            prompt_value=prompt_value,
+            prompt_mask=prompt_mask,
+            branch_weights=branch_weights,
+            mask=mask,
+            attention_temperature=attention_temperature,
+        )
 
         x = x + gate_msa.unsqueeze(1) * attn_output
 

@@ -120,6 +120,7 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
                   finalize,
                   use_prompt_cache=False,
                   prompt_cache_steps=None,
+                  grouped_prompt_inputs=None,
                   prompt_cache_len=0,
                   source_cache_len=0,
                   source_cache_end=0,
@@ -130,6 +131,21 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
         embedding = self.spk_embed_affine_layer(embedding)
 
         base_prompt_mel_len = prompt_feat.shape[1]
+        if grouped_prompt_inputs is not None and prompt_cache_steps is None:
+            return self._inference_grouped_prompt_uncached(
+                token=token,
+                token_len=token_len,
+                prompt_token=prompt_token,
+                prompt_token_len=prompt_token_len,
+                prompt_feat=prompt_feat,
+                prompt_feat_len=prompt_feat_len,
+                embedding=embedding,
+                streaming=streaming,
+                finalize=finalize,
+                grouped_prompt_inputs=grouped_prompt_inputs,
+                source_mel_offset=source_mel_offset,
+            )
+
         decoder_prompt_len = prompt_cache_len if prompt_cache_steps is not None else base_prompt_mel_len
         cached_history_mel = max(0, decoder_prompt_len - base_prompt_mel_len)
         if (
@@ -217,6 +233,98 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
         feat = feat[:, :, mel_len1:]
         assert feat.shape[2] == mel_len2
         return feat.float(), updated_cache
+
+    def _inference_grouped_prompt_uncached(
+            self,
+            token,
+            token_len,
+            prompt_token,
+            prompt_token_len,
+            prompt_feat,
+            prompt_feat_len,
+            embedding,
+            streaming,
+            finalize,
+            grouped_prompt_inputs,
+            source_mel_offset=0):
+        base_prompt_mel_len = prompt_feat.shape[1]
+        grouped_prompt_uncached = self._prepare_grouped_prompt_uncached_inputs(grouped_prompt_inputs)
+
+        token, token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + token_len
+        mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
+        token = self.input_embedding(torch.clamp(token, min=0)) * mask
+
+        if finalize is True:
+            h = self.pre_lookahead_layer(token)
+        else:
+            h = self.pre_lookahead_layer(token[:, :-self.pre_lookahead_len], context=token[:, -self.pre_lookahead_len:])
+        h = h.repeat_interleave(self.token_mel_ratio, dim=1)
+        mel_len1, mel_len2 = base_prompt_mel_len, h.shape[1] - base_prompt_mel_len
+        if mel_len2 < 0:
+            raise RuntimeError("grouped prompt source window is shorter than the dominant prompt")
+
+        conds = torch.zeros([1, mel_len1 + mel_len2, self.output_size], device=token.device).to(h.dtype)
+        conds[:, :mel_len1] = prompt_feat[:, :mel_len1].to(device=token.device, dtype=h.dtype)
+        conds = conds.transpose(1, 2)
+
+        mask = (~make_pad_mask(torch.tensor([mel_len1 + mel_len2], device=token.device))).to(h)
+        feat, updated_cache = self.decoder(
+            mu=h.transpose(1, 2).contiguous(),
+            mask=mask.unsqueeze(1),
+            spks=embedding,
+            cond=conds,
+            n_timesteps=10,
+            streaming=streaming,
+            prompt_len=mel_len1,
+            use_prompt_cache=False,
+            grouped_prompt_uncached=grouped_prompt_uncached,
+            source_cache_len=0,
+            source_cache_end=0,
+            source_mel_offset=source_mel_offset,
+        )
+        feat = feat[:, :, mel_len1:]
+        assert feat.shape[2] == mel_len2
+        return feat.float(), updated_cache
+
+    def _prepare_grouped_prompt_uncached_inputs(self, grouped_prompt_inputs):
+        prompt_tokens = grouped_prompt_inputs["prompt_tokens"]
+        prompt_feats = grouped_prompt_inputs["prompt_feats"]
+        embeddings = grouped_prompt_inputs["embeddings"]
+        weights = grouped_prompt_inputs["branch_weights"]
+        if not prompt_tokens:
+            raise ValueError("grouped prompt inputs have no active branches")
+
+        device = self.input_embedding.weight.device
+        branch_mus = []
+        branch_conds = []
+        branch_spks = []
+        for branch_token, branch_feat, branch_embedding in zip(prompt_tokens, prompt_feats, embeddings):
+            branch_token = branch_token.to(device=device)
+            branch_feat = branch_feat.to(device=device)
+            branch_embedding = F.normalize(branch_embedding.to(device=device), dim=1)
+            branch_spk = self.spk_embed_affine_layer(branch_embedding)
+
+            branch_token_len = torch.tensor([branch_token.shape[1]], dtype=torch.int32, device=device)
+            token_mask = (~make_pad_mask(branch_token_len)).unsqueeze(-1).to(branch_spk)
+            token_embed = self.input_embedding(torch.clamp(branch_token, min=0)) * token_mask
+            branch_h = self.pre_lookahead_layer(token_embed)
+            branch_h = branch_h.repeat_interleave(self.token_mel_ratio, dim=1)
+            branch_len = min(branch_feat.shape[1], branch_h.shape[1])
+            if branch_len <= 0:
+                raise ValueError("grouped prompt branch is too short")
+            branch_mus.append(branch_h[:, :branch_len].transpose(1, 2).contiguous())
+            branch_conds.append(branch_feat[:, :branch_len].to(dtype=branch_h.dtype).transpose(1, 2).contiguous())
+            branch_spks.append(branch_spk)
+
+        return {
+            "branch_mus": branch_mus,
+            "branch_conds": branch_conds,
+            "branch_spks": branch_spks,
+            "branch_weights": torch.tensor(weights, dtype=torch.float32, device=device),
+            "branch_indices": list(grouped_prompt_inputs.get("branch_indices", range(len(branch_mus)))),
+            "dominant_branch_position": int(grouped_prompt_inputs.get("dominant_branch_position", 0)),
+            "attention_temperature": float(grouped_prompt_inputs.get("attention_temperature", 1.0)),
+        }
 
     @torch.inference_mode()
     def prepare_prompt_cache(self,

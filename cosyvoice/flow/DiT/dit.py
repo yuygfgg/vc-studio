@@ -351,6 +351,46 @@ class DiT(nn.Module):
         attn_mask = attn_mask[:, :, prompt_len:, :]
 
         source_cache = []
+        if prompt_cache.get("grouped_branch_attention"):
+            grouped_kv = prompt_cache["grouped_kv"]
+            grouped_prompt_mask = prompt_cache["grouped_prompt_mask"]
+            branch_weights = prompt_cache["branch_weights"]
+            attention_temperature = float(prompt_cache.get("attention_temperature", 1.0))
+            for block, (prompt_key, prompt_value) in zip(self.transformer_blocks, grouped_kv):
+                if return_source_cache:
+                    x, source_key, source_value = block.forward_with_grouped_prompt_kv(
+                        x,
+                        t,
+                        prompt_key,
+                        prompt_value,
+                        grouped_prompt_mask,
+                        branch_weights,
+                        mask=attn_mask.bool(),
+                        rope=rope,
+                        return_kv=True,
+                        attention_temperature=attention_temperature,
+                    )
+                    source_cache.append((source_key, source_value))
+                else:
+                    x = block.forward_with_grouped_prompt_kv(
+                        x,
+                        t,
+                        prompt_key,
+                        prompt_value,
+                        grouped_prompt_mask,
+                        branch_weights,
+                        mask=attn_mask.bool(),
+                        rope=rope,
+                        attention_temperature=attention_temperature,
+                    )
+
+            x = self.norm_out(x, t)
+            output = self.proj_out(x).transpose(1, 2)
+            assert output.shape[2] == x_len
+            if return_source_cache:
+                return output, {"kv": source_cache, "source_len": x_len}
+            return output, None
+
         history_kv = prompt_cache.get("history_kv")
         if history_kv is None:
             prompt_kv_iter = zip(self.transformer_blocks, prompt_cache["kv"])
@@ -359,8 +399,8 @@ class DiT(nn.Module):
                 (
                     block,
                     (
-                        torch.cat([base_key, hist_key], dim=2),
-                        torch.cat([base_value, hist_value], dim=2),
+                        torch.cat([base_key.to(device=hist_key.device, dtype=hist_key.dtype), hist_key], dim=2),
+                        torch.cat([base_value.to(device=hist_value.device, dtype=hist_value.dtype), hist_value], dim=2),
                     ),
                 )
                 for block, (base_key, base_value), (hist_key, hist_value) in zip(self.transformer_blocks, prompt_cache["kv"], history_kv)
@@ -387,3 +427,170 @@ class DiT(nn.Module):
         if return_source_cache:
             return output, {"kv": source_cache, "source_len": x_len}
         return output, None
+
+    def forward_grouped_prompt_source_uncached(
+        self,
+        branch_prompt_x,
+        branch_prompt_mu,
+        branch_prompt_cond,
+        branch_spks,
+        source_x,
+        source_mu,
+        t,
+        source_spks,
+        source_cond,
+        branch_weights,
+        dominant_branch_position=0,
+        streaming=False,
+        source_mel_offset=0,
+        attention_temperature=1.0,
+    ):
+        if not branch_prompt_x:
+            raise ValueError("grouped prompt inputs have no active branches")
+
+        source_len = source_x.shape[2]
+        branch_count = len(branch_prompt_x)
+        branch_weights = branch_weights.to(device=source_x.device, dtype=source_x.dtype)
+        branch_hidden = []
+        branch_t = []
+        branch_masks = []
+        branch_ropes = []
+        branch_input_embed_caches = []
+
+        for prompt_x, prompt_mu, prompt_cond, prompt_spk in zip(
+            branch_prompt_x,
+            branch_prompt_mu,
+            branch_prompt_cond,
+            branch_spks,
+        ):
+            prompt_len = prompt_x.shape[2]
+            batch = prompt_x.size(0)
+            x_prompt_in = torch.zeros([2 * batch, 80, prompt_len], device=prompt_x.device, dtype=source_spks.dtype)
+            prompt_mu_in = torch.zeros([2 * batch, 80, prompt_len], device=prompt_x.device, dtype=source_spks.dtype)
+            prompt_cond_in = torch.zeros([2 * batch, 80, prompt_len], device=prompt_x.device, dtype=source_spks.dtype)
+            prompt_mask_in = torch.ones([2 * batch, 1, prompt_len], device=prompt_x.device, dtype=torch.bool)
+            t_in = torch.zeros([2 * batch], device=prompt_x.device, dtype=source_spks.dtype)
+            spks_in = torch.zeros([2 * batch, 80], device=prompt_x.device, dtype=source_spks.dtype)
+
+            x_prompt_in[:] = prompt_x
+            prompt_mu_in[:batch] = prompt_mu
+            prompt_cond_in[:batch] = prompt_cond
+            t_in[:] = t.reshape(1)
+            spks_in[:batch] = prompt_spk
+
+            hidden, input_embed_cache = self.input_embed.forward_return_cache(
+                x_prompt_in.transpose(1, 2),
+                prompt_cond_in.transpose(1, 2),
+                prompt_mu_in.transpose(1, 2),
+                spks_in,
+            )
+            t_emb = self.time_embed(t_in)
+            rope = self.rotary_embed.forward_from_seq_len(prompt_len)
+            if streaming is True:
+                attn_mask = add_optional_chunk_mask(
+                    hidden,
+                    prompt_mask_in.bool(),
+                    False,
+                    False,
+                    0,
+                    self.static_chunk_size,
+                    -1,
+                ).unsqueeze(dim=1)
+            else:
+                attn_mask = add_optional_chunk_mask(
+                    hidden,
+                    prompt_mask_in.bool(),
+                    False,
+                    False,
+                    0,
+                    0,
+                    -1,
+                ).repeat(1, hidden.size(1), 1).unsqueeze(dim=1)
+            branch_hidden.append(hidden)
+            branch_t.append(t_emb)
+            branch_masks.append(attn_mask.bool())
+            branch_ropes.append(rope)
+            branch_input_embed_caches.append(input_embed_cache)
+
+        dominant_branch_position = max(0, min(int(dominant_branch_position), branch_count - 1))
+        prompt_len = branch_prompt_x[dominant_branch_position].shape[2]
+        source_batch = source_x.size(0)
+        x_source_in = torch.zeros([2 * source_batch, 80, source_len], device=source_x.device, dtype=source_spks.dtype)
+        source_mu_in = torch.zeros([2 * source_batch, 80, source_len], device=source_x.device, dtype=source_spks.dtype)
+        source_cond_in = torch.zeros([2 * source_batch, 80, source_len], device=source_x.device, dtype=source_spks.dtype)
+        full_mask_in = torch.ones([2 * source_batch, 1, prompt_len + source_len], device=source_x.device, dtype=torch.bool)
+        t_in = torch.zeros([2 * source_batch], device=source_x.device, dtype=source_spks.dtype)
+        spks_in = torch.zeros([2 * source_batch, 80], device=source_x.device, dtype=source_spks.dtype)
+        x_source_in[:] = source_x
+        source_mu_in[:source_batch] = source_mu
+        source_cond_in[:source_batch] = source_cond
+        t_in[:] = t.reshape(1)
+        spks_in[:source_batch] = source_spks
+        source_t = self.time_embed(t_in)
+        source_hidden, _ = self.input_embed.forward_with_cache(
+            x_source_in.transpose(1, 2),
+            source_cond_in.transpose(1, 2),
+            source_mu_in.transpose(1, 2),
+            spks_in,
+            cache=branch_input_embed_caches[dominant_branch_position],
+        )
+
+        source_position_base = int(prompt_len) + max(int(source_mel_offset), 0)
+        source_positions = torch.arange(source_len, device=source_hidden.device) + source_position_base
+        source_rope = self.rotary_embed(source_positions)
+        positions = self.cached_source_positions(prompt_len + source_len, prompt_len, prompt_len, source_mel_offset, source_hidden.device)
+        if streaming is True:
+            source_attn_mask = self.global_chunk_mask(full_mask_in.bool(), positions)
+        else:
+            source_attn_mask = full_mask_in.bool().repeat(1, prompt_len + source_len, 1).unsqueeze(dim=1)
+        source_attn_mask = source_attn_mask[:, :, prompt_len:, :]
+
+        for block in self.transformer_blocks:
+            prompt_keys = []
+            prompt_values = []
+            for branch_index in range(branch_count):
+                hidden, key, value = block.forward_return_kv(
+                    branch_hidden[branch_index],
+                    branch_t[branch_index],
+                    mask=branch_masks[branch_index],
+                    rope=branch_ropes[branch_index],
+                )
+                branch_hidden[branch_index] = hidden
+                prompt_keys.append(key)
+                prompt_values.append(value)
+            grouped_key, grouped_value, grouped_mask = self._stack_current_grouped_prompt_kv(prompt_keys, prompt_values)
+            source_hidden = block.forward_with_grouped_prompt_kv(
+                source_hidden,
+                source_t,
+                grouped_key,
+                grouped_value,
+                grouped_mask,
+                branch_weights,
+                mask=source_attn_mask.bool(),
+                rope=source_rope,
+                attention_temperature=attention_temperature,
+            )
+
+        prompt_outputs = [
+            self.proj_out(self.norm_out(hidden, branch_t[index])).transpose(1, 2)
+            for index, hidden in enumerate(branch_hidden)
+        ]
+        source_output = self.proj_out(self.norm_out(source_hidden, source_t)).transpose(1, 2)
+        assert source_output.shape[2] == source_len
+        return prompt_outputs, source_output
+
+    def _stack_current_grouped_prompt_kv(self, keys, values):
+        max_len = max(key.shape[2] for key in keys)
+        first_key = keys[0]
+        first_value = values[0]
+        key_stack = first_key.new_zeros((len(keys), first_key.shape[0], first_key.shape[1], max_len, first_key.shape[3]))
+        value_stack = first_value.new_zeros(
+            (len(values), first_value.shape[0], first_value.shape[1], max_len, first_value.shape[3])
+        )
+        mask = torch.zeros((len(keys), max_len), dtype=torch.bool, device=first_key.device)
+        for branch_pos, (key, value) in enumerate(zip(keys, values)):
+            length = key.shape[2]
+            key_stack[branch_pos, :, :, :length] = key
+            value_stack[branch_pos, :, :, :length] = value
+            mask[branch_pos, :length] = True
+        return key_stack, value_stack, mask

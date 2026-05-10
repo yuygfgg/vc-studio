@@ -12,6 +12,10 @@ from pathlib import Path
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 
+from cosyvoice.vc.voice_package import (
+    read_voice_package_metadata,
+    validate_model_compatibility,
+)
 from vc_studio_backend import (
     BackendConfig,
     StreamSettings,
@@ -447,6 +451,7 @@ class VCStudioApp(QtWidgets.QMainWindow):
 
     def _create_variables(self, args: argparse.Namespace) -> None:
         self.model_dir_var = TextValue(args.model_dir)
+        self.voice_package_var = TextValue(args.voice_package)
         self.prompt_var = TextValue(args.prompt)
         self.source_var = TextValue(args.source)
         self.output_var = TextValue(args.output)
@@ -472,6 +477,14 @@ class VCStudioApp(QtWidgets.QMainWindow):
         self.hift_mode_var = TextValue(args.hift_mode)
         self.prompt_cache_var = BoolValue(not args.disable_prompt_kv_cache)
         self.history_cache_var = BoolValue(not args.disable_history_kv_cache)
+        self.prompt_cache_max_mb_var = TextValue(f"{getattr(args, 'prompt_cache_max_mb', 1024.0):g}")
+        self.prompt_cache_max_seconds_var = TextValue(f"{getattr(args, 'prompt_cache_max_seconds', 0.0):g}")
+        self.prompt_cache_dtype_var = TextValue(getattr(args, 'prompt_cache_dtype', "auto"))
+        self.prompt_cache_storage_var = TextValue(getattr(args, 'prompt_cache_storage', "device"))
+        self.grouped_prompt_var = BoolValue(
+            getattr(args, 'enable_grouped_prompt', False) or getattr(args, 'enable_grouped_prompt_cache', False)
+        )
+        self.grouped_prompt_cache_var = BoolValue(getattr(args, 'enable_grouped_prompt_cache', False))
         self.input_device_var = TextValue("Default")
         self.output_device_var = TextValue("Default")
         self.status_var = TextValue("Ready")
@@ -480,6 +493,14 @@ class VCStudioApp(QtWidgets.QMainWindow):
         self.metric_lag_var = TextValue("-")
         self.metric_buffer_var = TextValue("-")
         self.metric_underflow_var = TextValue("-")
+        self.package_output_var = TextValue("out/voice.cvvoice")
+        self.package_portrait_var = TextValue("")
+        self.package_display_name_var = TextValue("")
+        self.package_short_description_var = TextValue("")
+        self.package_fusion_mode_var = TextValue("equal_weight")
+        self.package_branch_gamma_var = TextValue("1.0")
+        self.package_attention_temperature_var = TextValue("1.0")
+        self.package_canonical_seconds_var = TextValue("10.0")
 
     def _configure_style(self) -> None:
         self.qt_app.setFont(QtGui.QFont("Nunito", 11))
@@ -745,6 +766,7 @@ class VCStudioApp(QtWidgets.QMainWindow):
 
         self.notebook = QtWidgets.QTabWidget()
         self.notebook.setDocumentMode(True)
+        self._build_voice_package_tab(self.notebook)
         self._build_realtime_tab(self.notebook)
         self._build_offline_tab(self.notebook)
         self._build_parameters_tab(self.notebook)
@@ -825,7 +847,7 @@ class VCStudioApp(QtWidgets.QMainWindow):
         form.setColumnStretch(1, 1)
         row = 0
         row = self._path_row(form, row, "Model dir", self.model_dir_var, "directory")
-        row = self._path_row(form, row, "Prompt wav", self.prompt_var, "open_wav")
+        row = self._path_row(form, row, "Voice package", self.voice_package_var, "open_cvvoice")
         row = self._combo_row(form, row, "Torch device", self.device_var, ["auto", "cpu", "cuda", "mps"])
         row = self._combo_row(form, row, "ORT provider", self.ort_provider_var, ["auto", "cpu", "cuda", "coreml"])
         self._path_row(form, row, "CoreML cache", self.coreml_cache_var, "directory")
@@ -848,6 +870,131 @@ class VCStudioApp(QtWidgets.QMainWindow):
         self._metric_card(metrics, 2, 0, "Underflows", self.metric_underflow_var, self.colors["purple"], 2)
         layout.addLayout(metrics)
         layout.addStretch(1)
+
+    def _build_voice_package_tab(self, notebook: QtWidgets.QTabWidget) -> None:
+        content = QtWidgets.QWidget()
+        content.setStyleSheet("background: transparent;")
+        layout = QtWidgets.QHBoxLayout(content)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(14)
+
+        create_card = self._card()
+        create_layout = QtWidgets.QVBoxLayout(create_card)
+        create_layout.setContentsMargins(18, 18, 18, 18)
+        create_layout.setSpacing(12)
+        create_layout.addWidget(self._section_title("🎁 Create Voice Package", self.colors["pink"]))
+
+        self.reference_table = QtWidgets.QTableWidget(0, 3)
+        self.reference_table.setHorizontalHeaderLabels(["Reference WAV", "Raw weight", "Normalized"])
+        self.reference_table.verticalHeader().setVisible(False)
+        self.reference_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.reference_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.reference_table.horizontalHeader().setStretchLastSection(False)
+        self.reference_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.reference_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.reference_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.reference_table.setMinimumHeight(185)
+        self.reference_table.itemChanged.connect(lambda _item: self._update_reference_weights())
+        create_layout.addWidget(self.reference_table)
+
+        ref_buttons = QtWidgets.QHBoxLayout()
+        ref_buttons.setSpacing(8)
+        for text, command in [
+            ("Add WAV", self._add_reference_files),
+            ("Add Folder", self._add_reference_folder),
+            ("Remove", self._remove_selected_references),
+            ("Up", lambda: self._move_selected_reference(-1)),
+            ("Down", lambda: self._move_selected_reference(1)),
+        ]:
+            ref_buttons.addWidget(self._ghost_button(text, command))
+        ref_buttons.addStretch(1)
+        create_layout.addLayout(ref_buttons)
+
+        form = QtWidgets.QFormLayout()
+        form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+        form.setFormAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
+        form.setHorizontalSpacing(14)
+        form.setVerticalSpacing(10)
+        self._combo_form_row(
+            form,
+            "Fusion mode",
+            self.package_fusion_mode_var,
+            ["equal_weight", "duration_weight", "manual_weight"],
+            "Controls how accepted reference branches are weighted before normalization.",
+        )
+        self.package_fusion_mode_var.changed.connect(lambda _value: self._update_reference_weights())
+        self._number_row(form, "Branch gamma", self.package_branch_gamma_var, "Sharpens cross-branch weights after normalization.")
+        self._number_row(
+            form,
+            "Attention temp",
+            self.package_attention_temperature_var,
+            "Stored with the package for grouped prompt attention compatibility.",
+        )
+        self._number_row(
+            form,
+            "Canonical sec",
+            self.package_canonical_seconds_var,
+            "Stable source position base used by package metadata.",
+        )
+        self._path_form_row(
+            form,
+            "Portrait",
+            self.package_portrait_var,
+            "open_image",
+            "Optional PNG, JPEG, or WEBP portrait stored inside the package.",
+        )
+        self._path_form_row(
+            form,
+            "Output",
+            self.package_output_var,
+            "save_cvvoice",
+            "Destination .cvvoice file.",
+        )
+        self._text_form_row(form, "Display name", self.package_display_name_var, "Name shown in package inspection.")
+        self._text_form_row(form, "Short note", self.package_short_description_var, "Brief package description.")
+        create_layout.addLayout(form)
+
+        long_label = self._field_label("Long description")
+        self.package_long_description_edit = QtWidgets.QTextEdit()
+        self.package_long_description_edit.setMinimumHeight(95)
+        self.package_long_description_edit.setAcceptRichText(False)
+        create_layout.addWidget(long_label)
+        create_layout.addWidget(self.package_long_description_edit)
+
+        action_row = QtWidgets.QHBoxLayout()
+        self.create_package_button = CuteButton(
+            "Create Package",
+            self._start_package_create,
+            base=self.colors["mint"],
+            hover=self.colors["mint_strong"],
+            disabled=self.colors["disabled"],
+            min_width=142,
+        )
+        action_row.addWidget(self.create_package_button)
+        action_row.addStretch(1)
+        create_layout.addLayout(action_row)
+        layout.addWidget(create_card, 3)
+
+        inspect_card = self._card()
+        inspect_layout = QtWidgets.QVBoxLayout(inspect_card)
+        inspect_layout.setContentsMargins(18, 18, 18, 18)
+        inspect_layout.setSpacing(12)
+        inspect_layout.addWidget(self._section_title("🔎 Inspect Package", self.colors["sky"]))
+        inspect_form = QtWidgets.QGridLayout()
+        inspect_form.setHorizontalSpacing(8)
+        inspect_form.setVerticalSpacing(10)
+        inspect_form.setColumnStretch(1, 1)
+        self._path_row(inspect_form, 0, "Package", self.voice_package_var, "open_cvvoice")
+        inspect_layout.addLayout(inspect_form)
+        inspect_button = self._ghost_button("Inspect", self._inspect_package_current)
+        inspect_layout.addWidget(inspect_button, 0, QtCore.Qt.AlignmentFlag.AlignLeft)
+        self.package_inspect_text = QtWidgets.QTextEdit()
+        self.package_inspect_text.setReadOnly(True)
+        self.package_inspect_text.setMinimumHeight(360)
+        inspect_layout.addWidget(self.package_inspect_text, 1)
+        layout.addWidget(inspect_card, 2)
+
+        notebook.addTab(self._scroll(content), "🎁 Voice Package")
 
     def _build_realtime_tab(self, notebook: QtWidgets.QTabWidget) -> None:
         content = QtWidgets.QWidget()
@@ -1091,9 +1238,51 @@ class VCStudioApp(QtWidgets.QMainWindow):
             "Extra padding around detected speech. Raising it preserves starts and endings, but passes "
             "more room tone; lowering it gates tighter and may clip edges.",
         )
+        self._checkbox_row(
+            quality_form,
+            "Prompt KV cache",
+            self.prompt_cache_var,
+            "Caches target-speaker prompt attention in streaming flow. Enabling it reduces repeated compute "
+            "and latency; disabling can help diagnose cache-related artifacts.",
+        )
+        self._number_row(
+            quality_form,
+            "Prompt cache MiB",
+            self.prompt_cache_max_mb_var,
+            "Upper bound for prepared prompt KV cache memory. If the full prompt does not fit, cache is disabled "
+            "instead of truncating the prompt. Set 0 for no automatic budget limit.",
+        )
+        self._number_row(
+            quality_form,
+            "Prompt cache sec",
+            self.prompt_cache_max_seconds_var,
+            "Maximum full prompt duration allowed in the KV cache. If the prompt is longer, cache is disabled "
+            "and quality is preserved. Set 0 to follow the memory budget.",
+        )
+        self._checkbox_row(
+            quality_form,
+            "Grouped prompt",
+            self.grouped_prompt_var,
+            "For multi-reference packages, use grouped branch attention for prompt fusion. This can change "
+            "voice quality and timbre; if cache is unavailable, the same quality path is recomputed per window.",
+        )
+        self._checkbox_row(
+            quality_form,
+            "Grouped prompt cache",
+            self.grouped_prompt_cache_var,
+            "Caches all active grouped prompt branches when Grouped prompt is enabled. This is a performance "
+            "option only; if it cannot fit, grouped prompt remains enabled without cache.",
+        )
         quality_layout.addLayout(quality_form)
 
         advanced_panel, advanced_form = self._advanced_panel()
+        self._path_form_row(
+            advanced_form,
+            "Legacy prompt WAV",
+            self.prompt_var,
+            "open_wav",
+            "Used only when the Voice package field is empty.",
+        )
         self._combo_form_row(
             advanced_form,
             "Flow context",
@@ -1110,12 +1299,19 @@ class VCStudioApp(QtWidgets.QMainWindow):
             "Vocoder state strategy. stateful reuses caches for lower compute and real-time smoothness; "
             "window recomputes bounded context and is safer for quality debugging.",
         )
-        self._checkbox_row(
+        self._combo_form_row(
             advanced_form,
-            "Prompt KV cache",
-            self.prompt_cache_var,
-            "Caches target-speaker prompt attention in streaming flow. Enabling it reduces repeated compute "
-            "and latency; disabling can help diagnose cache-related artifacts.",
+            "Prompt cache dtype",
+            self.prompt_cache_dtype_var,
+            ["auto", "float32", "float16", "bfloat16"],
+            "Storage dtype for cached K/V tensors. auto uses half precision on GPU/MPS and float32 on CPU.",
+        )
+        self._combo_form_row(
+            advanced_form,
+            "Prompt cache storage",
+            self.prompt_cache_storage_var,
+            ["device", "cpu_offload"],
+            "Keep cached K/V on the active device, or store it in CPU memory and transfer per step.",
         )
         self._checkbox_row(
             advanced_form,
@@ -1229,6 +1425,36 @@ class VCStudioApp(QtWidgets.QMainWindow):
         field.setMaximumWidth(190)
         self._bind_line_edit(field, variable)
         form.addRow(self._field_label(label), self._described_control(field, description))
+
+    def _text_form_row(
+        self,
+        form: QtWidgets.QFormLayout,
+        label: str,
+        variable: TextValue,
+        description: str,
+    ) -> None:
+        field = QtWidgets.QLineEdit()
+        self._bind_line_edit(field, variable)
+        form.addRow(self._field_label(label), self._described_control(field, description))
+
+    def _path_form_row(
+        self,
+        form: QtWidgets.QFormLayout,
+        label: str,
+        variable: TextValue,
+        kind: str,
+        description: str,
+    ) -> None:
+        holder = QtWidgets.QWidget()
+        row = QtWidgets.QHBoxLayout(holder)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        field = QtWidgets.QLineEdit()
+        self._bind_line_edit(field, variable)
+        button = self._ghost_button("Browse", lambda: self._browse_path(variable, kind))
+        row.addWidget(field, 1)
+        row.addWidget(button)
+        form.addRow(self._field_label(label), self._described_control(holder, description))
 
     def _path_row(
         self,
@@ -1435,6 +1661,27 @@ class VCStudioApp(QtWidgets.QMainWindow):
         initial = self._initial_dir(variable.get())
         if kind == "directory":
             value = QtWidgets.QFileDialog.getExistingDirectory(self, "Select directory", initial)
+        elif kind == "open_cvvoice":
+            value, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self,
+                "Open Voice Package",
+                initial,
+                "CosyVoice package (*.cvvoice);;All files (*.*)",
+            )
+        elif kind == "save_cvvoice":
+            value, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self,
+                "Save Voice Package",
+                variable.get() or str(Path(initial) / "voice.cvvoice"),
+                "CosyVoice package (*.cvvoice);;All files (*.*)",
+            )
+        elif kind == "open_image":
+            value, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self,
+                "Open Portrait",
+                initial,
+                "Images (*.png *.jpg *.jpeg *.webp);;All files (*.*)",
+            )
         elif kind == "save_wav":
             value, _ = QtWidgets.QFileDialog.getSaveFileName(
                 self,
@@ -1492,6 +1739,268 @@ class VCStudioApp(QtWidgets.QMainWindow):
         if hasattr(self, "output_device_combo"):
             self._replace_combo_items(self.output_device_combo, self.output_device_var, list(self.output_device_map.keys()))
 
+    def _add_reference_files(self) -> None:
+        initial = self._initial_dir(self.model_dir_var.get())
+        values, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self,
+            "Add Reference WAV Files",
+            initial,
+            "WAV audio (*.wav);;All files (*.*)",
+        )
+        for value in values:
+            self._append_reference_row(value, "1.0")
+        self._update_reference_weights()
+
+    def _add_reference_folder(self) -> None:
+        initial = self._initial_dir(self.model_dir_var.get())
+        value = QtWidgets.QFileDialog.getExistingDirectory(self, "Add Reference Folder", initial)
+        if not value:
+            return
+        for path in sorted(Path(value).glob("*.wav")):
+            self._append_reference_row(str(path), "1.0")
+        self._update_reference_weights()
+
+    def _append_reference_row(self, path: str, weight: str) -> None:
+        if not path:
+            return
+        existing = {self.reference_table.item(row, 0).text() for row in range(self.reference_table.rowCount())}
+        if path in existing:
+            return
+        row = self.reference_table.rowCount()
+        self.reference_table.insertRow(row)
+        path_item = QtWidgets.QTableWidgetItem(path)
+        path_item.setFlags(path_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+        weight_item = QtWidgets.QTableWidgetItem(weight)
+        normalized_item = QtWidgets.QTableWidgetItem("-")
+        normalized_item.setFlags(normalized_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+        self.reference_table.setItem(row, 0, path_item)
+        self.reference_table.setItem(row, 1, weight_item)
+        self.reference_table.setItem(row, 2, normalized_item)
+
+    def _remove_selected_references(self) -> None:
+        rows = sorted({index.row() for index in self.reference_table.selectedIndexes()}, reverse=True)
+        for row in rows:
+            self.reference_table.removeRow(row)
+        self._update_reference_weights()
+
+    def _move_selected_reference(self, direction: int) -> None:
+        rows = sorted({index.row() for index in self.reference_table.selectedIndexes()})
+        if not rows:
+            return
+        if direction < 0:
+            rows_iter = rows
+        else:
+            rows_iter = list(reversed(rows))
+        for row in rows_iter:
+            target = row + direction
+            if target < 0 or target >= self.reference_table.rowCount():
+                continue
+            self._swap_reference_rows(row, target)
+        self.reference_table.clearSelection()
+        for row in [max(0, min(self.reference_table.rowCount() - 1, row + direction)) for row in rows]:
+            self.reference_table.selectRow(row)
+        self._update_reference_weights()
+
+    def _swap_reference_rows(self, left: int, right: int) -> None:
+        values_left = [self.reference_table.item(left, col).text() for col in range(3)]
+        values_right = [self.reference_table.item(right, col).text() for col in range(3)]
+        for col, value in enumerate(values_right):
+            self.reference_table.item(left, col).setText(value)
+        for col, value in enumerate(values_left):
+            self.reference_table.item(right, col).setText(value)
+
+    def _reference_paths_and_weights(self) -> tuple[list[str], list[float]]:
+        paths = []
+        weights = []
+        manual_mode = self.package_fusion_mode_var.get() == "manual_weight"
+        for row in range(self.reference_table.rowCount()):
+            path_item = self.reference_table.item(row, 0)
+            weight_item = self.reference_table.item(row, 1)
+            path = path_item.text().strip() if path_item is not None else ""
+            if not path:
+                continue
+            paths.append(path)
+            if manual_mode:
+                try:
+                    weights.append(float((weight_item.text() if weight_item is not None else "1.0").strip()))
+                except ValueError as error:
+                    raise ValueError(f"Raw weight for row {row + 1} must be a number.") from error
+            else:
+                weights.append(1.0)
+        return paths, weights
+
+    def _update_reference_weights(self) -> None:
+        if not hasattr(self, "reference_table"):
+            return
+        mode = self.package_fusion_mode_var.get()
+        row_count = self.reference_table.rowCount()
+        raw_weights = []
+        for row in range(row_count):
+            if mode == "equal_weight":
+                raw = 1.0
+            elif mode == "duration_weight":
+                raw = self._reference_duration_seconds(row)
+            else:
+                item = self.reference_table.item(row, 1)
+                try:
+                    raw = float(item.text()) if item is not None else 1.0
+                except ValueError:
+                    raw = 0.0
+            raw_weights.append(max(0.0, raw))
+        total = sum(weight for weight in raw_weights if weight > 0)
+        blocker = QtCore.QSignalBlocker(self.reference_table)
+        try:
+            for row, raw in enumerate(raw_weights):
+                raw_item = self.reference_table.item(row, 1)
+                normalized_item = self.reference_table.item(row, 2)
+                if raw_item is None or normalized_item is None:
+                    continue
+                if mode != "manual_weight":
+                    raw_item.setText(f"{raw:.6g}")
+                    raw_item.setFlags(raw_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                else:
+                    raw_item.setFlags(raw_item.flags() | QtCore.Qt.ItemFlag.ItemIsEditable)
+                normalized = raw / total if raw > 0 and total > 0 else 0.0
+                suffix = " (masked)" if normalized <= 0.0 and row_count > 0 else ""
+                normalized_item.setText(f"{normalized:.4f}{suffix}")
+        finally:
+            del blocker
+
+    def _reference_duration_seconds(self, row: int) -> float:
+        item = self.reference_table.item(row, 0)
+        if item is None:
+            return 0.0
+        try:
+            import soundfile as sf
+
+            info = sf.info(item.text())
+            if info.samplerate <= 0:
+                return 0.0
+            return max(0.0, float(info.frames) / float(info.samplerate))
+        except Exception:
+            return 0.0
+
+    def _start_package_create(self) -> None:
+        if self._is_running():
+            QtWidgets.QMessageBox.information(self, "Busy", "A job is already running.")
+            return
+        try:
+            config = self._snapshot_model_config()
+            references, manual_weights = self._reference_paths_and_weights()
+            if not references:
+                raise ValueError("At least one reference WAV is required.")
+            output_path = self.package_output_var.get().strip()
+            if not output_path:
+                raise ValueError("Output .cvvoice path is required.")
+            if not output_path.lower().endswith(".cvvoice"):
+                output_path += ".cvvoice"
+                self.package_output_var.set(output_path)
+            options = self._package_options(manual_weights)
+        except ValueError as error:
+            QtWidgets.QMessageBox.critical(self, "Invalid package settings", str(error))
+            return
+        self._set_running("package", True)
+        self.worker_thread = threading.Thread(
+            target=self._package_worker,
+            args=(config, references, output_path, options),
+            daemon=True,
+        )
+        self.worker_thread.start()
+
+    def _package_options(self, manual_weights: list[float]) -> dict:
+        if any(weight < 0 for weight in manual_weights):
+            raise ValueError("Manual raw weights must be non-negative.")
+        branch_gamma = self._positive_float(self.package_branch_gamma_var, "Branch gamma")
+        attention_temperature = self._positive_float(self.package_attention_temperature_var, "Attention temp")
+        canonical_seconds = self._positive_float(self.package_canonical_seconds_var, "Canonical sec")
+        options = {
+            "fusion_mode": self.package_fusion_mode_var.get(),
+            "manual_weights": manual_weights,
+            "branch_weight_gamma": branch_gamma,
+            "attention_temperature": attention_temperature,
+            "canonical_prompt_length_seconds": canonical_seconds,
+            "display_name": self.package_display_name_var.get().strip(),
+            "short_description": self.package_short_description_var.get().strip(),
+            "long_description": self.package_long_description_edit.toPlainText(),
+        }
+        portrait = self.package_portrait_var.get().strip()
+        if portrait:
+            options["portrait_path"] = str(Path(portrait).expanduser())
+        return options
+
+    def _inspect_package_current(self) -> None:
+        package_path = self.voice_package_var.get().strip()
+        if not package_path:
+            QtWidgets.QMessageBox.information(self, "No package", "Choose a .cvvoice package first.")
+            return
+        try:
+            metadata = read_voice_package_metadata(package_path)
+            compatibility = "unknown (model directory not set)"
+            model_dir = self.model_dir_var.get().strip()
+            if model_dir:
+                try:
+                    validate_model_compatibility(metadata, Path(model_dir).expanduser())
+                    compatibility = "compatible"
+                except Exception as error:
+                    compatibility = f"incompatible: {error}"
+            self.package_inspect_text.setPlainText(self._format_package_metadata(metadata, compatibility))
+        except Exception as error:
+            QtWidgets.QMessageBox.critical(self, "Package inspection failed", str(error))
+
+    def _format_package_metadata(self, metadata: dict, compatibility: str) -> str:
+        lines = [
+            f"name: {metadata.get('display_name') or metadata.get('package_id')}",
+            f"package_id: {metadata.get('package_id')}",
+            f"format_version: {metadata.get('format_version')}",
+            f"model: {metadata.get('model_family')} / {metadata.get('model_dir_name')}",
+            f"compatibility: {compatibility}",
+            f"size: {self._format_bytes(int(metadata.get('package_bytes', 0)))}",
+            f"prompt_seconds: {float(metadata.get('prompt_seconds', 0.0)):.3f}",
+            f"reference_count: {metadata.get('reference_count')}",
+            f"branch_count: {metadata.get('branch_count')}",
+            f"feature_dtype: {metadata.get('feature_dtype')}",
+            f"fusion_mode: {metadata.get('fusion_mode')}",
+            f"prompt_fusion: {metadata.get('prompt_fusion_algorithm')}",
+            f"tail_policy: {metadata.get('flow_token_tail_fusion_policy')}",
+            f"branch_weight_gamma: {metadata.get('branch_weight_gamma')}",
+            f"attention_temperature: {metadata.get('attention_temperature')}",
+            f"source_position_policy: {metadata.get('source_position_policy')}",
+            f"canonical_prompt_length_seconds: {metadata.get('canonical_prompt_length_seconds')}",
+            f"tensor_sha256: {metadata.get('tensor_sha256')}",
+        ]
+        if metadata.get("portrait_path"):
+            lines.extend(
+                [
+                    f"portrait: {metadata.get('portrait_path')} ({metadata.get('portrait_mime_type')})",
+                    f"portrait_size: {metadata.get('portrait_width')}x{metadata.get('portrait_height')}",
+                ]
+            )
+        lines.append("")
+        lines.append("sources:")
+        for source in metadata.get("prompt_sources", []):
+            lines.append(
+                "  branch={branch} file={file} seconds={seconds:.3f} tokens={tokens} "
+                "raw={raw:.4f} normalized={normalized:.4f} masked={masked} sha256={sha}".format(
+                    branch=source.get("branch_index"),
+                    file=source.get("path_basename"),
+                    seconds=float(source.get("accepted_seconds", 0.0)),
+                    tokens=source.get("token_frames"),
+                    raw=float(source.get("fusion_weight_raw", 0.0)),
+                    normalized=float(source.get("fusion_weight_normalized", 0.0)),
+                    masked=source.get("is_masked"),
+                    sha=source.get("file_sha256"),
+                )
+            )
+        return "\n".join(lines)
+
+    def _format_bytes(self, value: int) -> str:
+        amount = float(value)
+        for unit in ["B", "KiB", "MiB", "GiB"]:
+            if amount < 1024.0 or unit == "GiB":
+                return f"{amount:.1f} {unit}" if unit != "B" else f"{int(amount)} B"
+            amount /= 1024.0
+        return f"{value} B"
+
     def _start_offline(self) -> None:
         if self._is_running():
             QtWidgets.QMessageBox.information(self, "Busy", "A job is already running.")
@@ -1545,15 +2054,18 @@ class VCStudioApp(QtWidgets.QMainWindow):
 
     def _snapshot_config(self, require_source: bool) -> BackendConfig:
         model_dir = self.model_dir_var.get().strip()
+        voice_package = self.voice_package_var.get().strip()
         prompt = self.prompt_var.get().strip()
         if not model_dir:
             raise ValueError("Model directory is required.")
-        if not prompt:
-            raise ValueError("Prompt wav is required.")
         if not Path(model_dir).expanduser().is_dir():
             raise ValueError("Model directory does not exist.")
-        if not Path(prompt).expanduser().is_file():
-            raise ValueError("Prompt wav does not exist.")
+        if not voice_package and not prompt:
+            raise ValueError("Voice package is required. Use Legacy prompt WAV only from advanced settings.")
+        if voice_package and not Path(voice_package).expanduser().is_file():
+            raise ValueError("Voice package does not exist.")
+        if prompt and not Path(prompt).expanduser().is_file():
+            raise ValueError("Legacy prompt WAV does not exist.")
         if require_source and not self.source_var.get().strip():
             raise ValueError("Source wav is required for offline benchmark.")
         if require_source and not Path(self.source_var.get().strip()).expanduser().is_file():
@@ -1565,7 +2077,8 @@ class VCStudioApp(QtWidgets.QMainWindow):
         coreml_cache = self.coreml_cache_var.get().strip()
         return BackendConfig(
             model_dir=str(Path(model_dir).expanduser()),
-            prompt=str(Path(prompt).expanduser()),
+            prompt=str(Path(prompt).expanduser()) if prompt else "",
+            voice_package=str(Path(voice_package).expanduser()) if voice_package else "",
             source=str(Path(source).expanduser()) if source else "",
             output=str(Path(output).expanduser()),
             csv=str(Path(csv_path).expanduser()) if csv_path else "",
@@ -1573,6 +2086,26 @@ class VCStudioApp(QtWidgets.QMainWindow):
             ort_provider=self.ort_provider_var.get(),
             coreml_cache_dir=str(Path(coreml_cache).expanduser()) if coreml_cache else None,
             settings=settings,
+        )
+
+    def _snapshot_model_config(self) -> BackendConfig:
+        model_dir = self.model_dir_var.get().strip()
+        if not model_dir:
+            raise ValueError("Model directory is required.")
+        if not Path(model_dir).expanduser().is_dir():
+            raise ValueError("Model directory does not exist.")
+        coreml_cache = self.coreml_cache_var.get().strip()
+        return BackendConfig(
+            model_dir=str(Path(model_dir).expanduser()),
+            prompt="",
+            voice_package="",
+            source="",
+            output="",
+            csv="",
+            device=self.device_var.get(),
+            ort_provider=self.ort_provider_var.get(),
+            coreml_cache_dir=str(Path(coreml_cache).expanduser()) if coreml_cache else None,
+            settings=self._settings_from_form(),
         )
 
     def _settings_from_form(self) -> StreamSettings:
@@ -1594,6 +2127,14 @@ class VCStudioApp(QtWidgets.QMainWindow):
                     "Silero VAD is enabled, but the optional silero-vad package is not installed. "
                     "Install requirements.txt or run `pip install silero-vad`."
                 )
+        prompt_cache_max_mb = self._nonnegative_float(self.prompt_cache_max_mb_var, "Prompt cache MiB")
+        prompt_cache_max_seconds = self._nonnegative_float(self.prompt_cache_max_seconds_var, "Prompt cache sec")
+        prompt_cache_dtype = self.prompt_cache_dtype_var.get()
+        if prompt_cache_dtype not in {"auto", "float32", "float16", "bfloat16"}:
+            raise ValueError("Prompt cache dtype must be auto, float32, float16, or bfloat16.")
+        prompt_cache_storage = self.prompt_cache_storage_var.get()
+        if prompt_cache_storage not in {"device", "cpu_offload"}:
+            raise ValueError("Prompt cache storage must be device or cpu_offload.")
         return StreamSettings(
             chunk_sec=chunk_sec,
             tokenizer_chunk_sec=tokenizer_chunk_sec if tokenizer_chunk_sec > 0 else None,
@@ -1613,6 +2154,12 @@ class VCStudioApp(QtWidgets.QMainWindow):
             hift_mode=self.hift_mode_var.get(),
             disable_prompt_kv_cache=not self.prompt_cache_var.get(),
             disable_history_kv_cache=not self.history_cache_var.get(),
+            prompt_cache_max_mb=prompt_cache_max_mb,
+            prompt_cache_max_seconds=prompt_cache_max_seconds,
+            prompt_cache_dtype=prompt_cache_dtype,
+            prompt_cache_storage=prompt_cache_storage,
+            enable_grouped_prompt=self.grouped_prompt_var.get(),
+            enable_grouped_prompt_cache=self.grouped_prompt_var.get() and self.grouped_prompt_cache_var.get(),
         )
 
     def _positive_float(self, variable: TextValue, name: str) -> float:
@@ -1652,6 +2199,28 @@ class VCStudioApp(QtWidgets.QMainWindow):
             self._post_exception("Offline benchmark failed", error)
         finally:
             self._post("finished", "offline")
+
+    def _package_worker(
+        self,
+        config: BackendConfig,
+        references: list[str],
+        output_path: str,
+        options: dict,
+    ) -> None:
+        try:
+            self.backend.create_voice_package(
+                config,
+                references,
+                output_path,
+                options,
+                status_fn=lambda message: self._post("status", message),
+                log_fn=lambda message: self._post("log", message),
+            )
+            self._post("voice_package_created", output_path)
+        except Exception as error:
+            self._post_exception("Voice package creation failed", error)
+        finally:
+            self._post("finished", "package")
 
     def _realtime_worker(self, config: BackendConfig) -> None:
         try:
@@ -1696,6 +2265,8 @@ class VCStudioApp(QtWidgets.QMainWindow):
         self.active_mode = mode if running else None
         self.start_live_button.configure(state="disabled" if running else "normal")
         self.run_offline_button.configure(state="disabled" if running else "normal")
+        if hasattr(self, "create_package_button"):
+            self.create_package_button.configure(state="disabled" if running else "normal")
         self.stop_live_button.configure(state="normal" if running and mode == "realtime" else "disabled")
         self.stop_offline_button.configure(state="normal" if running and mode == "offline" else "disabled")
         self.status_var.set("Starting..." if running else "Ready")
@@ -1720,6 +2291,9 @@ class VCStudioApp(QtWidgets.QMainWindow):
                 self.metric_lag_var.set(metrics["lag"])
                 self.metric_buffer_var.set(metrics["buffer"])
                 self.metric_underflow_var.set(metrics["underflows"])
+            elif kind == "voice_package_created":
+                self.voice_package_var.set(str(payload))
+                self._inspect_package_current()
             elif kind == "finished":
                 self._set_running(str(payload), False)
 
