@@ -88,14 +88,46 @@ class InputEmbedding(nn.Module):
             text_embed: float["b n d"],
             spks: float["b d"],
     ):
+        x = self.project_inputs(x, cond, text_embed, spks)
+        x = self.conv_pos_embed(x) + x
+        return x
+
+    def forward_with_cache(
+            self,
+            x: float["b n d"],
+            cond: float["b n d"],
+            text_embed: float["b n d"],
+            spks: float["b d"],
+            cache: dict[str, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        x = self.project_inputs(x, cond, text_embed, spks)
+        pos, cache = self.conv_pos_embed.forward_with_cache(x, cache=cache)
+        return pos + x, cache
+
+    def forward_return_cache(
+            self,
+            x: float["b n d"],
+            cond: float["b n d"],
+            text_embed: float["b n d"],
+            spks: float["b d"],
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        x = self.project_inputs(x, cond, text_embed, spks)
+        pos, cache = self.conv_pos_embed.forward_return_cache(x)
+        return pos + x, cache
+
+    def project_inputs(
+            self,
+            x: float["b n d"],
+            cond: float["b n d"],
+            text_embed: float["b n d"],
+            spks: float["b d"],
+    ) -> torch.Tensor:
         to_cat = [x, cond, text_embed]
         if self.spk_dim > 0:
             spks = repeat(spks, "b c -> b t c", t=x.shape[1])
             to_cat.append(spks)
 
-        x = self.proj(torch.cat(to_cat, dim=-1))
-        x = self.conv_pos_embed(x) + x
-        return x
+        return self.proj(torch.cat(to_cat, dim=-1))
 
 
 # Transformer backbone using DiT blocks
@@ -225,7 +257,7 @@ class DiT(nn.Module):
             t = t.repeat(batch)
 
         t = self.time_embed(t)
-        x = self.input_embed(x, cond, mu, spks.squeeze(1))
+        x, input_embed_cache = self.input_embed.forward_return_cache(x, cond, mu, spks.squeeze(1))
         rope = self.rotary_embed.forward_from_seq_len(seq_len)
 
         if streaming is True:
@@ -240,7 +272,32 @@ class DiT(nn.Module):
 
         x = self.norm_out(x, t)
         output = self.proj_out(x).transpose(1, 2)
-        return output, {"kv": cache, "prompt_len": seq_len, "base_prompt_len": seq_len}
+        return output, {
+            "kv": cache,
+            "prompt_len": seq_len,
+            "base_prompt_len": seq_len,
+            "input_embed_cache": input_embed_cache,
+        }
+
+    def extend_input_embed_cache(
+        self,
+        cache: dict[str, torch.Tensor] | None,
+        x,
+        mu,
+        cond,
+        spks,
+    ) -> dict[str, torch.Tensor] | None:
+        if cache is None:
+            return None
+        if x.shape[2] == 0:
+            return cache
+        x = x.transpose(1, 2)
+        mu = mu.transpose(1, 2)
+        cond = cond.transpose(1, 2)
+        if spks.ndim == 3:
+            spks = spks.squeeze(1)
+        _, cache = self.input_embed.forward_with_cache(x, cond, mu, spks, cache=cache)
+        return cache
 
     def forward_source_with_prompt_cache(
         self,
@@ -261,16 +318,27 @@ class DiT(nn.Module):
         prompt_len = prompt_cache["prompt_len"]
         base_prompt_len = prompt_cache.get("base_prompt_len", prompt_len)
         x_len = x.shape[2]
-        x_full = torch.cat([prompt_x, x], dim=2).transpose(1, 2)
-        mu_full = torch.cat([prompt_mu, mu], dim=2).transpose(1, 2)
-        cond_full = torch.cat([prompt_cond, cond], dim=2).transpose(1, 2)
         spks = spks.unsqueeze(dim=1)
-        batch, seq_len = x_full.shape[0], x_full.shape[1]
+        batch = x.shape[0]
+        seq_len = prompt_len + x_len
         if t.ndim == 0:
             t = t.repeat(batch)
 
         t = self.time_embed(t)
-        x = self.input_embed(x_full, cond_full, mu_full, spks.squeeze(1))[:, prompt_len:]
+        input_embed_cache = prompt_cache.get("input_embed_cache")
+        if input_embed_cache is None:
+            x_full = torch.cat([prompt_x, x], dim=2).transpose(1, 2)
+            mu_full = torch.cat([prompt_mu, mu], dim=2).transpose(1, 2)
+            cond_full = torch.cat([prompt_cond, cond], dim=2).transpose(1, 2)
+            x = self.input_embed(x_full, cond_full, mu_full, spks.squeeze(1))[:, prompt_len:]
+        else:
+            x, _ = self.input_embed.forward_with_cache(
+                x.transpose(1, 2),
+                cond.transpose(1, 2),
+                mu.transpose(1, 2),
+                spks.squeeze(1),
+                cache=input_embed_cache,
+            )
         source_position_base = int(base_prompt_len) + max(int(source_mel_offset), 0)
         source_positions = torch.arange(x_len, device=x.device) + source_position_base
         rope = self.rotary_embed(source_positions)
@@ -279,7 +347,7 @@ class DiT(nn.Module):
         if streaming is True:
             attn_mask = self.global_chunk_mask(mask.bool(), positions)
         else:
-            attn_mask = add_optional_chunk_mask(x_full, mask.bool(), False, False, 0, 0, -1).repeat(1, seq_len, 1).unsqueeze(dim=1)
+            attn_mask = mask.bool().repeat(1, seq_len, 1).unsqueeze(dim=1)
         attn_mask = attn_mask[:, :, prompt_len:, :]
 
         source_cache = []

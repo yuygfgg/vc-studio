@@ -1,6 +1,6 @@
 # VC Studio
 
-CosyVoice3 base model v3 for Realtime Voice Conversion.
+High performance CosyVoice3 based Realtime Voice Conversion studio.
 
 ## Model
 

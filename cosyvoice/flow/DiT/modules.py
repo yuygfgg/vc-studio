@@ -132,16 +132,76 @@ class CausalConvPositionEmbedding(nn.Module):
             x = x.masked_fill(~mask, 0.0)
 
         x = x.permute(0, 2, 1)
-        x = F.pad(x, (self.kernel_size - 1, 0, 0, 0))
-        x = self.conv1(x)
-        x = F.pad(x, (self.kernel_size - 1, 0, 0, 0))
-        x = self.conv2(x)
+        x = self.conv1(F.pad(x, (self.kernel_size - 1, 0, 0, 0)))
+        x = self.conv2(F.pad(x, (self.kernel_size - 1, 0, 0, 0)))
         out = x.permute(0, 2, 1)
 
         if mask is not None:
             out = out.masked_fill(~mask, 0.0)
 
         return out
+
+    def forward_return_cache(
+        self,
+        x: float["b n d"],
+        mask: bool["b n"] | None = None,  # noqa: F722
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if mask is not None:
+            mask = mask[..., None]
+            x = x.masked_fill(~mask, 0.0)
+
+        x = x.permute(0, 2, 1)
+        conv1 = self.conv1(F.pad(x, (self.kernel_size - 1, 0, 0, 0)))
+        conv2 = self.conv2(F.pad(conv1, (self.kernel_size - 1, 0, 0, 0)))
+        out = conv2.permute(0, 2, 1)
+
+        if mask is not None:
+            out = out.masked_fill(~mask, 0.0)
+
+        return out, self._cache_from_tails(x, conv1)
+
+    def forward_with_cache(
+        self,
+        x: float["b n d"],
+        cache: dict[str, torch.Tensor] | None = None,
+        mask: bool["b n"] | None = None,  # noqa: F722
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if cache is None:
+            return self.forward_return_cache(x, mask=mask)
+
+        if mask is not None:
+            mask = mask[..., None]
+            x = x.masked_fill(~mask, 0.0)
+
+        x = x.permute(0, 2, 1)
+        input_tail = cache["input_tail"].to(device=x.device, dtype=x.dtype)
+        conv1_tail = cache["conv1_tail"].to(device=x.device, dtype=x.dtype)
+
+        input_with_tail = torch.cat([input_tail, x], dim=2)
+        conv1_input = self._left_pad_for_tail(input_with_tail, input_tail.shape[2])
+        conv1 = self.conv1(conv1_input)
+        conv1_with_tail = torch.cat([conv1_tail, conv1], dim=2)
+        conv2_input = self._left_pad_for_tail(conv1_with_tail, conv1_tail.shape[2])
+        conv2 = self.conv2(conv2_input)
+        out = conv2.permute(0, 2, 1)
+
+        if mask is not None:
+            out = out.masked_fill(~mask, 0.0)
+
+        return out, self._cache_from_tails(input_with_tail, conv1_with_tail)
+
+    def _left_pad_for_tail(self, x: torch.Tensor, tail_size: int) -> torch.Tensor:
+        left = self.kernel_size - 1
+        if tail_size >= left:
+            return x
+        return F.pad(x, (left - tail_size, 0, 0, 0))
+
+    def _cache_from_tails(self, x: torch.Tensor, conv1: torch.Tensor) -> dict[str, torch.Tensor]:
+        left = self.kernel_size - 1
+        return {
+            "input_tail": x[:, :, -left:].detach(),
+            "conv1_tail": conv1[:, :, -left:].detach(),
+        }
 
 
 # rotary positional embedding related

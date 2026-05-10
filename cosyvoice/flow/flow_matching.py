@@ -527,19 +527,31 @@ class CausalConditionalCFM(ConditionalCFM):
         for base_step, source_step in zip(base_cache["steps"], source_step_caches):
             source_cache = source_step["source_cache"]
             source_inputs = source_step["source_inputs"]
+            input_embed_cache = None
+            if isinstance(self.estimator, torch.nn.Module):
+                input_embed_cache = self.estimator.extend_input_embed_cache(
+                    base_step["prompt_cache"].get("input_embed_cache"),
+                    source_inputs["x_source_in"][:, :, source_start:source_end],
+                    source_inputs["source_mu_in"][:, :, source_start:source_end],
+                    source_inputs["source_cond_in"][:, :, source_start:source_end],
+                    base_step["prompt_inputs"]["spks_in"],
+                )
+            prompt_cache = {
+                "kv": base_step["prompt_cache"]["kv"],
+                "history_kv": [
+                    (
+                        key[:, :, source_start:source_end].detach(),
+                        value[:, :, source_start:source_end].detach(),
+                    )
+                    for key, value in source_cache["kv"]
+                ],
+                "prompt_len": base_len + history_len,
+                "base_prompt_len": base_len,
+            }
+            if input_embed_cache is not None:
+                prompt_cache["input_embed_cache"] = input_embed_cache
             steps.append({
-                "prompt_cache": {
-                    "kv": base_step["prompt_cache"]["kv"],
-                    "history_kv": [
-                        (
-                            key[:, :, source_start:source_end].detach(),
-                            value[:, :, source_start:source_end].detach(),
-                        )
-                        for key, value in source_cache["kv"]
-                    ],
-                    "prompt_len": base_len + history_len,
-                    "base_prompt_len": base_len,
-                },
+                "prompt_cache": prompt_cache,
                 "prompt_inputs": {
                     "x_prompt_in": base_step["prompt_inputs"]["x_prompt_in"],
                     "prompt_mu_in": base_step["prompt_inputs"]["prompt_mu_in"],
@@ -625,7 +637,7 @@ class CausalConditionalCFM(ConditionalCFM):
         x_prompt_in = prompt_inputs["x_prompt_in"]
         prompt_mu_in = prompt_inputs["prompt_mu_in"]
         prompt_cond_in = prompt_inputs["prompt_cond_in"]
-        if "history_x_in" in prompt_inputs:
+        if "history_x_in" in prompt_inputs and "input_embed_cache" not in prompt_cache:
             x_prompt_in = torch.cat([x_prompt_in, prompt_inputs["history_x_in"]], dim=2)
             prompt_mu_in = torch.cat([prompt_mu_in, prompt_inputs["history_mu_in"]], dim=2)
             prompt_cond_in = torch.cat([prompt_cond_in, prompt_inputs["history_cond_in"]], dim=2)

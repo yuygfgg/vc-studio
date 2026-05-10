@@ -129,6 +129,58 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
         embedding = F.normalize(embedding, dim=1)
         embedding = self.spk_embed_affine_layer(embedding)
 
+        base_prompt_mel_len = prompt_feat.shape[1]
+        decoder_prompt_len = prompt_cache_len if prompt_cache_steps is not None else base_prompt_mel_len
+        cached_history_mel = max(0, decoder_prompt_len - base_prompt_mel_len)
+        if (
+            prompt_cache_steps is not None
+            and isinstance(prompt_cache_steps, dict)
+            and prompt_cache_steps.get("flow_token_tail") is not None
+            and cached_history_mel % self.token_mel_ratio == 0
+        ):
+            cached_history_tokens = cached_history_mel // self.token_mel_ratio
+            has_source_context = finalize is True or token.shape[1] - cached_history_tokens > self.pre_lookahead_len
+            if token.shape[1] >= cached_history_tokens and has_source_context:
+                source_token = token[:, cached_history_tokens:]
+                h, source_token_embed = self._source_conditioning_from_tail(
+                    source_token,
+                    prompt_cache_steps["flow_token_tail"],
+                    finalize=finalize,
+                )
+                total_mel_len = decoder_prompt_len + h.shape[1]
+                mu = torch.zeros([1, total_mel_len, self.output_size], device=token.device, dtype=h.dtype)
+                mu[:, decoder_prompt_len:] = h
+                conds = torch.zeros(
+                    [1, total_mel_len, self.output_size],
+                    device=token.device,
+                    dtype=h.dtype,
+                ).transpose(1, 2)
+                mask = torch.ones([1, total_mel_len], device=token.device, dtype=torch.bool)
+                feat, updated_cache = self.decoder(
+                    mu=mu.transpose(1, 2).contiguous(),
+                    mask=mask.unsqueeze(1),
+                    spks=embedding,
+                    cond=conds,
+                    n_timesteps=10,
+                    streaming=streaming,
+                    prompt_len=decoder_prompt_len,
+                    use_prompt_cache=use_prompt_cache,
+                    prompt_cache_steps=prompt_cache_steps,
+                    source_cache_len=source_cache_len,
+                    source_cache_end=source_cache_end,
+                    source_mel_offset=source_mel_offset,
+                )
+                self._attach_flow_conditioning_tail(
+                    updated_cache,
+                    prompt_cache_steps,
+                    source_token_embed,
+                    source_cache_len,
+                    source_cache_end,
+                )
+                feat = feat[:, :, base_prompt_mel_len:]
+                assert feat.shape[2] == cached_history_mel + h.shape[1]
+                return feat.float(), updated_cache
+
         # concat text and prompt_text
         token, token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + token_len
         mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
@@ -140,7 +192,7 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
         else:
             h = self.pre_lookahead_layer(token[:, :-self.pre_lookahead_len], context=token[:, -self.pre_lookahead_len:])
         h = h.repeat_interleave(self.token_mel_ratio, dim=1)
-        mel_len1, mel_len2 = prompt_feat.shape[1], h.shape[1] - prompt_feat.shape[1]
+        mel_len1, mel_len2 = base_prompt_mel_len, h.shape[1] - base_prompt_mel_len
 
         # get conditions
         conds = torch.zeros([1, mel_len1 + mel_len2, self.output_size], device=token.device).to(h.dtype)
@@ -148,7 +200,6 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
         conds = conds.transpose(1, 2)
 
         mask = (~make_pad_mask(torch.tensor([mel_len1 + mel_len2]))).to(h)
-        decoder_prompt_len = prompt_cache_len if prompt_cache_steps is not None else mel_len1
         feat, updated_cache = self.decoder(
             mu=h.transpose(1, 2).contiguous(),
             mask=mask.unsqueeze(1),
@@ -200,7 +251,60 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
             cond=cond,
             streaming=streaming,
         )
+        cache_token_len = min(prompt_token.shape[1], cache_len // self.token_mel_ratio)
+        cache["flow_token_tail"] = self._conditioning_tail_from_embedding(token[:, :cache_token_len])
         return cache_len, cache
+
+    def _source_conditioning_from_tail(
+        self,
+        token: torch.Tensor,
+        token_tail: torch.Tensor,
+        finalize: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        token_embed = self.input_embedding(torch.clamp(token, min=0))
+        if finalize is True:
+            emit_embed = token_embed
+            context = torch.zeros(0, 0, 0, device=token.device, dtype=token_embed.dtype)
+        else:
+            emit_embed = token_embed[:, :-self.pre_lookahead_len]
+            context = token_embed[:, -self.pre_lookahead_len:]
+        token_tail = token_tail.to(device=token.device, dtype=token_embed.dtype)
+        combined = torch.cat([token_tail, emit_embed], dim=1) if token_tail.shape[1] > 0 else emit_embed
+        h = self.pre_lookahead_layer(combined, context=context)
+        h = h[:, token_tail.shape[1]:]
+        return h.repeat_interleave(self.token_mel_ratio, dim=1), token_embed
+
+    def _conditioning_tail_from_embedding(self, token_embed: torch.Tensor) -> torch.Tensor:
+        tail_size = self._conditioning_tail_size()
+        return token_embed[:, -tail_size:].detach()
+
+    def _attach_flow_conditioning_tail(
+        self,
+        updated_cache,
+        prompt_cache_steps,
+        source_token_embed: torch.Tensor,
+        source_cache_len: int,
+        source_cache_end: int,
+    ) -> None:
+        if updated_cache is None or source_cache_len <= 0:
+            return
+        token_tail = prompt_cache_steps.get("flow_token_tail") if isinstance(prompt_cache_steps, dict) else None
+        if token_tail is None:
+            return
+        source_cache_tokens = source_cache_len // self.token_mel_ratio
+        source_cache_end_tokens = source_cache_end // self.token_mel_ratio if source_cache_end > 0 else source_token_embed.shape[1]
+        source_cache_end_tokens = min(source_cache_end_tokens, source_token_embed.shape[1])
+        source_cache_start_tokens = max(0, source_cache_end_tokens - source_cache_tokens)
+        selected = source_token_embed[:, source_cache_start_tokens:source_cache_end_tokens]
+        updated_cache["flow_token_tail"] = self._merge_conditioning_tail(token_tail, selected)
+
+    def _merge_conditioning_tail(self, token_tail: torch.Tensor, token_embed: torch.Tensor) -> torch.Tensor:
+        token_tail = token_tail.to(device=token_embed.device, dtype=token_embed.dtype)
+        merged = torch.cat([token_tail, token_embed], dim=1) if token_embed.shape[1] > 0 else token_tail
+        return merged[:, -self._conditioning_tail_size():].detach()
+
+    def _conditioning_tail_size(self) -> int:
+        return int(self.pre_lookahead_layer.conv2.kernel_size[0] - 1)
 
 
 if __name__ == '__main__':
