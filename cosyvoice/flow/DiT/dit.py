@@ -1,0 +1,321 @@
+
+"""
+ein notation:
+b - batch
+n - sequence
+nt - text sequence
+nw - raw wave length
+d - dimension
+"""
+
+from __future__ import annotations
+
+import torch
+from torch import nn
+import torch.nn.functional as F
+from einops import repeat
+from x_transformers.x_transformers import RotaryEmbedding
+from cosyvoice.utils.mask import add_optional_chunk_mask
+from cosyvoice.flow.DiT.modules import (
+    TimestepEmbedding,
+    ConvNeXtV2Block,
+    CausalConvPositionEmbedding,
+    DiTBlock,
+    AdaLayerNormZero_Final,
+    precompute_freqs_cis,
+    get_pos_embed_indices,
+)
+
+
+# Text embedding
+
+
+class TextEmbedding(nn.Module):
+    def __init__(self, text_num_embeds, text_dim, conv_layers=0, conv_mult=2):
+        super().__init__()
+        self.text_embed = nn.Embedding(text_num_embeds + 1, text_dim)  # use 0 as filler token
+
+        if conv_layers > 0:
+            self.extra_modeling = True
+            self.precompute_max_pos = 4096  # ~44s of 24khz audio
+            self.register_buffer("freqs_cis", precompute_freqs_cis(text_dim, self.precompute_max_pos), persistent=False)
+            self.text_blocks = nn.Sequential(
+                *[ConvNeXtV2Block(text_dim, text_dim * conv_mult) for _ in range(conv_layers)]
+            )
+        else:
+            self.extra_modeling = False
+
+    def forward(self, text: int["b nt"], seq_len, drop_text=False):  # noqa: F722
+        batch, text_len = text.shape[0], text.shape[1]
+        text = text + 1  # use 0 as filler token. preprocess of batch pad -1, see list_str_to_idx()
+        text = text[:, :seq_len]  # curtail if character tokens are more than the mel spec tokens
+        text = F.pad(text, (0, seq_len - text_len), value=0)
+
+        if drop_text:  # cfg for text
+            text = torch.zeros_like(text)
+
+        text = self.text_embed(text)  # b n -> b n d
+
+        # possible extra modeling
+        if self.extra_modeling:
+            # sinus pos emb
+            batch_start = torch.zeros((batch,), dtype=torch.long)
+            pos_idx = get_pos_embed_indices(batch_start, seq_len, max_pos=self.precompute_max_pos)
+            text_pos_embed = self.freqs_cis[pos_idx]
+            text = text + text_pos_embed
+
+            # convnextv2 blocks
+            text = self.text_blocks(text)
+
+        return text
+
+
+# noised input audio and context mixing embedding
+
+
+class InputEmbedding(nn.Module):
+    def __init__(self, mel_dim, text_dim, out_dim, spk_dim=None):
+        super().__init__()
+        spk_dim = 0 if spk_dim is None else spk_dim
+        self.spk_dim = spk_dim
+        self.proj = nn.Linear(mel_dim * 2 + text_dim + spk_dim, out_dim)
+        self.conv_pos_embed = CausalConvPositionEmbedding(dim=out_dim)
+
+    def forward(
+            self,
+            x: float["b n d"],
+            cond: float["b n d"],
+            text_embed: float["b n d"],
+            spks: float["b d"],
+    ):
+        to_cat = [x, cond, text_embed]
+        if self.spk_dim > 0:
+            spks = repeat(spks, "b c -> b t c", t=x.shape[1])
+            to_cat.append(spks)
+
+        x = self.proj(torch.cat(to_cat, dim=-1))
+        x = self.conv_pos_embed(x) + x
+        return x
+
+
+# Transformer backbone using DiT blocks
+
+
+class DiT(nn.Module):
+    def __init__(
+        self,
+        *,
+        dim,
+        depth=8,
+        heads=8,
+        dim_head=64,
+        dropout=0.1,
+        ff_mult=4,
+        mel_dim=80,
+        mu_dim=None,
+        long_skip_connection=False,
+        spk_dim=None,
+        out_channels=None,
+        static_chunk_size=50,
+        num_decoding_left_chunks=2
+    ):
+        super().__init__()
+
+        self.time_embed = TimestepEmbedding(dim)
+        if mu_dim is None:
+            mu_dim = mel_dim
+        self.input_embed = InputEmbedding(mel_dim, mu_dim, dim, spk_dim)
+
+        self.rotary_embed = RotaryEmbedding(dim_head)
+
+        self.dim = dim
+        self.depth = depth
+
+        self.transformer_blocks = nn.ModuleList(
+            [DiTBlock(dim=dim, heads=heads, dim_head=dim_head, ff_mult=ff_mult, dropout=dropout) for _ in range(depth)]
+        )
+        self.long_skip_connection = nn.Linear(dim * 2, dim, bias=False) if long_skip_connection else None
+
+        self.norm_out = AdaLayerNormZero_Final(dim)  # final modulation
+        self.proj_out = nn.Linear(dim, mel_dim)
+        self.out_channels = out_channels
+        self.static_chunk_size = static_chunk_size
+        self.num_decoding_left_chunks = num_decoding_left_chunks
+
+    def forward(
+        self,
+        x,
+        mask,
+        mu,
+        t,
+        spks=None,
+        cond=None,
+        streaming=False,
+        prompt_len=0,
+        source_mel_offset=0,
+    ):
+        x = x.transpose(1, 2)
+        mu = mu.transpose(1, 2)
+        cond = cond.transpose(1, 2)
+        spks = spks.unsqueeze(dim=1)
+        batch, seq_len = x.shape[0], x.shape[1]
+        if t.ndim == 0:
+            t = t.repeat(batch)
+
+        # t: conditioning time, c: context (text + masked cond audio), x: noised input audio
+        t = self.time_embed(t)
+        x = self.input_embed(x, cond, mu, spks.squeeze(1))
+
+        positions = self.source_window_positions(seq_len, prompt_len, source_mel_offset, x.device)
+        rope = self.rotary_embed(positions)
+
+        if self.long_skip_connection is not None:
+            residual = x
+
+        if streaming is True:
+            attn_mask = self.global_chunk_mask(mask.bool(), positions)
+        else:
+            attn_mask = add_optional_chunk_mask(x, mask.bool(), False, False, 0, 0, -1).repeat(1, x.size(1), 1).unsqueeze(dim=1)
+
+        for block in self.transformer_blocks:
+            x = block(x, t, mask=attn_mask.bool(), rope=rope)
+
+        if self.long_skip_connection is not None:
+            x = self.long_skip_connection(torch.cat((x, residual), dim=-1))
+
+        x = self.norm_out(x, t)
+        output = self.proj_out(x).transpose(1, 2)
+        return output
+
+    def source_window_positions(self, seq_len, prompt_len=0, source_mel_offset=0, device=None):
+        prompt_len = min(max(int(prompt_len), 0), int(seq_len))
+        source_mel_offset = max(int(source_mel_offset or 0), 0)
+        source_len = int(seq_len) - prompt_len
+        prompt_pos = torch.arange(prompt_len, device=device)
+        source_pos = torch.arange(source_len, device=device) + prompt_len + source_mel_offset
+        return torch.cat([prompt_pos, source_pos], dim=0)
+
+    def cached_source_positions(self, seq_len, prompt_len, base_prompt_len, source_mel_offset=0, device=None):
+        prompt_len = min(max(int(prompt_len), 0), int(seq_len))
+        base_prompt_len = min(max(int(base_prompt_len), 0), prompt_len)
+        source_mel_offset = max(int(source_mel_offset or 0), 0)
+        source_len = int(seq_len) - prompt_len
+        history_len = prompt_len - base_prompt_len
+        prompt_pos = torch.arange(base_prompt_len, device=device)
+        source_start = base_prompt_len + source_mel_offset
+        history_start = max(base_prompt_len, source_start - history_len)
+        history_pos = torch.arange(history_start, source_start, device=device)
+        source_pos = torch.arange(source_len, device=device) + source_start
+        return torch.cat([prompt_pos, history_pos, source_pos], dim=0)
+
+    def global_chunk_mask(self, mask, positions):
+        if self.static_chunk_size <= 0:
+            return mask.repeat(1, positions.numel(), 1).unsqueeze(dim=1)
+        block_end = (torch.div(positions, self.static_chunk_size, rounding_mode='trunc') + 1) * self.static_chunk_size
+        chunk_mask = positions.unsqueeze(0) < block_end.unsqueeze(1)
+        return (mask & chunk_mask.unsqueeze(0)).unsqueeze(dim=1)
+
+    def forward_prompt_cache(self, x, mask, mu, t, spks=None, cond=None, streaming=False):
+        x = x.transpose(1, 2)
+        mu = mu.transpose(1, 2)
+        cond = cond.transpose(1, 2)
+        spks = spks.unsqueeze(dim=1)
+        batch, seq_len = x.shape[0], x.shape[1]
+        if t.ndim == 0:
+            t = t.repeat(batch)
+
+        t = self.time_embed(t)
+        x = self.input_embed(x, cond, mu, spks.squeeze(1))
+        rope = self.rotary_embed.forward_from_seq_len(seq_len)
+
+        if streaming is True:
+            attn_mask = add_optional_chunk_mask(x, mask.bool(), False, False, 0, self.static_chunk_size, -1).unsqueeze(dim=1)
+        else:
+            attn_mask = add_optional_chunk_mask(x, mask.bool(), False, False, 0, 0, -1).repeat(1, x.size(1), 1).unsqueeze(dim=1)
+
+        cache = []
+        for block in self.transformer_blocks:
+            x, key, value = block.forward_return_kv(x, t, mask=attn_mask.bool(), rope=rope)
+            cache.append((key, value))
+
+        x = self.norm_out(x, t)
+        output = self.proj_out(x).transpose(1, 2)
+        return output, {"kv": cache, "prompt_len": seq_len, "base_prompt_len": seq_len}
+
+    def forward_source_with_prompt_cache(
+        self,
+        x,
+        mask,
+        mu,
+        t,
+        spks=None,
+        cond=None,
+        prompt_x=None,
+        prompt_mu=None,
+        prompt_cond=None,
+        prompt_cache=None,
+        streaming=False,
+        return_source_cache=False,
+        source_mel_offset=0,
+    ):
+        prompt_len = prompt_cache["prompt_len"]
+        base_prompt_len = prompt_cache.get("base_prompt_len", prompt_len)
+        x_len = x.shape[2]
+        x_full = torch.cat([prompt_x, x], dim=2).transpose(1, 2)
+        mu_full = torch.cat([prompt_mu, mu], dim=2).transpose(1, 2)
+        cond_full = torch.cat([prompt_cond, cond], dim=2).transpose(1, 2)
+        spks = spks.unsqueeze(dim=1)
+        batch, seq_len = x_full.shape[0], x_full.shape[1]
+        if t.ndim == 0:
+            t = t.repeat(batch)
+
+        t = self.time_embed(t)
+        x = self.input_embed(x_full, cond_full, mu_full, spks.squeeze(1))[:, prompt_len:]
+        source_position_base = int(base_prompt_len) + max(int(source_mel_offset), 0)
+        source_positions = torch.arange(x_len, device=x.device) + source_position_base
+        rope = self.rotary_embed(source_positions)
+        positions = self.cached_source_positions(seq_len, prompt_len, base_prompt_len, source_mel_offset, x.device)
+
+        if streaming is True:
+            attn_mask = self.global_chunk_mask(mask.bool(), positions)
+        else:
+            attn_mask = add_optional_chunk_mask(x_full, mask.bool(), False, False, 0, 0, -1).repeat(1, seq_len, 1).unsqueeze(dim=1)
+        attn_mask = attn_mask[:, :, prompt_len:, :]
+
+        source_cache = []
+        history_kv = prompt_cache.get("history_kv")
+        if history_kv is None:
+            prompt_kv_iter = zip(self.transformer_blocks, prompt_cache["kv"])
+        else:
+            prompt_kv_iter = (
+                (
+                    block,
+                    (
+                        torch.cat([base_key, hist_key], dim=2),
+                        torch.cat([base_value, hist_value], dim=2),
+                    ),
+                )
+                for block, (base_key, base_value), (hist_key, hist_value) in zip(self.transformer_blocks, prompt_cache["kv"], history_kv)
+            )
+
+        for block, (prompt_key, prompt_value) in prompt_kv_iter:
+            if return_source_cache:
+                x, source_key, source_value = block.forward_with_prompt_kv(
+                    x,
+                    t,
+                    prompt_key,
+                    prompt_value,
+                    mask=attn_mask.bool(),
+                    rope=rope,
+                    return_kv=True,
+                )
+                source_cache.append((source_key, source_value))
+            else:
+                x = block.forward_with_prompt_kv(x, t, prompt_key, prompt_value, mask=attn_mask.bool(), rope=rope)
+
+        x = self.norm_out(x, t)
+        output = self.proj_out(x).transpose(1, 2)
+        assert output.shape[2] == x_len
+        if return_source_cache:
+            return output, {"kv": source_cache, "source_len": x_len}
+        return output, None

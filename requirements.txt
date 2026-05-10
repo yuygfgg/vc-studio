@@ -1,0 +1,13 @@
+conformer==0.3.2
+diffusers==0.29.0
+einops>=0.8
+librosa>=0.10.2
+numpy>=1.26
+omegaconf==2.3.0
+onnxruntime>=1.18
+openai-whisper>=20231117
+scipy>=1.10
+soundfile>=0.12
+torch>=2.3
+torchaudio>=2.3
+x-transformers>=2.0
