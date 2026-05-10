@@ -8,6 +8,7 @@ onnxruntime>=1.18
 openai-whisper>=20231117
 scipy>=1.10
 soundfile>=0.12
+sounddevice>=0.4.7
 torch>=2.3
 torchaudio>=2.3
 x-transformers>=2.0
