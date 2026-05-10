@@ -20,28 +20,28 @@ from vc_studio_backend import (
 
 
 PALETTE = {
-    "bg": "#FAF9F6",
-    "surface": "#FFF7FA",
-    "surface_alt": "#F5FBFF",
-    "panel": "#FFF2F6",
-    "card": "#FFFCF5",
+    "bg": "#FFF0F5",
+    "surface": "#FFE4E1",
+    "surface_alt": "#F0F8FF",
+    "panel": "#FFF5EE",
+    "card": "#FFFFFF",
     "field": "#FFFDF8",
-    "text": "#2B3A55",
-    "muted": "#6F7891",
-    "line": "#E8DCEF",
-    "pink": "#FFD1DC",
-    "pink_strong": "#FFB7B2",
-    "mint": "#B5EAD7",
-    "mint_strong": "#A0E8AF",
+    "text": "#5C4B51",
+    "muted": "#9A8C98",
+    "line": "#FAD2E1",
+    "pink": "#FFC2D1",
+    "pink_strong": "#FF8FAB",
+    "mint": "#C1FBA4",
+    "mint_strong": "#7BF1A8",
     "sky": "#A2D2FF",
     "sky_soft": "#C7CEEA",
     "cream": "#FFDAC1",
     "yellow": "#FDFD96",
     "purple": "#E2C6FF",
     "purple_strong": "#CDB4DB",
-    "danger": "#F28B82",
-    "danger_hover": "#E57373",
-    "disabled": "#D8D2DA",
+    "danger": "#FFB4A2",
+    "danger_hover": "#E5989B",
+    "disabled": "#E5E5E5",
 }
 
 
@@ -86,14 +86,14 @@ class KawaiiBackdrop(QtWidgets.QWidget):
         super().__init__()
         self.colors = colors
         self.phase = 0.0
-        self.petals = [
-            (0.06, 0.08, 0.16, 10, colors["pink"]),
-            (0.18, 0.62, 0.10, 8, colors["cream"]),
-            (0.34, 0.22, 0.14, 7, colors["purple"]),
-            (0.52, 0.78, 0.12, 9, colors["mint"]),
-            (0.71, 0.14, 0.09, 8, colors["sky"]),
-            (0.84, 0.54, 0.13, 10, colors["pink_strong"]),
-            (0.94, 0.30, 0.11, 7, colors["cream"]),
+        self.elements = [
+            ('petal', 0.06, 0.08, 0.16, 12, colors["pink"]),
+            ('star', 0.18, 0.62, 0.10, 10, colors["cream"]),
+            ('heart', 0.34, 0.22, 0.14, 15, colors["pink_strong"]),
+            ('star', 0.52, 0.78, 0.12, 14, colors["mint"]),
+            ('petal', 0.71, 0.14, 0.09, 10, colors["sky"]),
+            ('heart', 0.84, 0.54, 0.13, 16, colors["purple"]),
+            ('star', 0.94, 0.30, 0.11, 12, colors["yellow"]),
         ]
         self.sparkles = [
             (0.12, 0.35, colors["sky"]),
@@ -104,10 +104,10 @@ class KawaiiBackdrop(QtWidgets.QWidget):
         ]
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self._tick)
-        self.timer.start(80)
+        self.timer.start(50)
 
     def _tick(self) -> None:
-        self.phase = (self.phase + 0.006) % 1.0
+        self.phase = (self.phase + 0.003) % 1.0
         self.update()
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
@@ -117,16 +117,23 @@ class KawaiiBackdrop(QtWidgets.QWidget):
 
         width = self.width()
         height = self.height()
-        self._draw_wave(painter, width, height, self.colors["surface"], 0.08, 0.23)
-        self._draw_wave(painter, width, height, self.colors["surface_alt"], 0.16, 0.30)
+        self._draw_wave(painter, width, height, self.colors["surface"], 0.08, 0.23, 0.0)
+        self._draw_wave(painter, width, height, self.colors["surface_alt"], 0.16, 0.30, 0.5)
 
-        for x_frac, y_frac, speed, size, color in self.petals:
-            x = x_frac * width + 14 * math.sin((self.phase + x_frac) * math.tau)
-            y = (y_frac + self.phase * speed) % 1.05 * height - 20
-            self._draw_petal(painter, x, y, size, color, self.phase * 180 + x_frac * 90)
+        for el_type, x_frac, y_frac, speed, size, color in self.elements:
+            x = x_frac * width + 20 * math.sin((self.phase * 5 + x_frac) * math.tau)
+            y = (y_frac + self.phase * speed * 2) % 1.1 * height - 30
+            angle = self.phase * 360 + x_frac * 180
+            
+            if el_type == 'petal':
+                self._draw_petal(painter, x, y, size, color, angle)
+            elif el_type == 'star':
+                self._draw_star(painter, x, y, size, color, 180, angle)
+            elif el_type == 'heart':
+                self._draw_heart(painter, x, y, size, color, 160, angle)
 
         for x_frac, y_frac, color in self.sparkles:
-            alpha = 70 + int(45 * (1 + math.sin((self.phase + x_frac) * math.tau)))
+            alpha = 70 + int(85 * (1 + math.sin((self.phase * 4 + x_frac) * math.tau)))
             self._draw_sparkle(painter, x_frac * width, y_frac * height, color, alpha)
 
     def _draw_wave(
@@ -137,27 +144,75 @@ class KawaiiBackdrop(QtWidgets.QWidget):
         color: str,
         top: float,
         depth: float,
+        phase_offset: float,
     ) -> None:
         path = QtGui.QPainterPath()
         path.moveTo(0, top * height)
-        path.cubicTo(width * 0.22, depth * height, width * 0.46, top * height, width * 0.68, depth * height)
-        path.cubicTo(width * 0.84, (top + 0.08) * height, width, depth * height, width, top * height)
+        p1y = depth * height + 15 * math.sin((self.phase * 2 + phase_offset) * math.tau)
+        p2y = top * height + 15 * math.cos((self.phase * 2 + phase_offset) * math.tau)
+        p3y = depth * height + 15 * math.sin((self.phase * 2 + phase_offset + 0.5) * math.tau)
+        path.cubicTo(width * 0.22, p1y, width * 0.46, p2y, width * 0.68, p3y)
+        path.cubicTo(width * 0.84, p2y, width, p1y, width, top * height)
         path.lineTo(width, 0)
         path.lineTo(0, 0)
         path.closeSubpath()
         fill = QtGui.QColor(color)
-        fill.setAlpha(150)
+        fill.setAlpha(180)
         painter.fillPath(path, fill)
 
-    def _draw_petal(self, painter: QtGui.QPainter, x: float, y: float, size: int, color: str, angle: float) -> None:
+    def _draw_petal(self, painter: QtGui.QPainter, x: float, y: float, size: float, color: str, angle: float) -> None:
+        import math
         painter.save()
         painter.translate(x, y)
         painter.rotate(angle)
         fill = QtGui.QColor(color)
-        fill.setAlpha(92)
+        fill.setAlpha(160)
         painter.setBrush(fill)
         painter.setPen(QtCore.Qt.PenStyle.NoPen)
         painter.drawEllipse(QtCore.QRectF(-size * 0.42, -size * 0.18, size * 0.84, size * 1.28))
+        painter.restore()
+
+    def _draw_star(self, painter: QtGui.QPainter, x: float, y: float, size: float, color: str, alpha: int, angle: float) -> None:
+        import math
+        painter.save()
+        painter.translate(x, y)
+        painter.rotate(angle)
+        fill = QtGui.QColor(color)
+        fill.setAlpha(alpha)
+        painter.setBrush(fill)
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        path = QtGui.QPainterPath()
+        points = 5
+        outer_radius = size
+        inner_radius = size * 0.4
+        for i in range(points * 2):
+            radius = outer_radius if i % 2 == 0 else inner_radius
+            theta = math.pi * i / points - math.pi / 2
+            px = radius * math.cos(theta)
+            py = radius * math.sin(theta)
+            if i == 0:
+                path.moveTo(px, py)
+            else:
+                path.lineTo(px, py)
+        path.closeSubpath()
+        painter.drawPath(path)
+        painter.restore()
+
+    def _draw_heart(self, painter: QtGui.QPainter, x: float, y: float, size: float, color: str, alpha: int, angle: float) -> None:
+        import math
+        painter.save()
+        painter.translate(x, y)
+        painter.rotate(angle)
+        fill = QtGui.QColor(color)
+        fill.setAlpha(alpha)
+        painter.setBrush(fill)
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        path = QtGui.QPainterPath()
+        path.moveTo(0, -size * 0.2)
+        path.cubicTo(-size * 0.8, -size * 0.8, -size, size * 0.3, 0, size * 0.8)
+        path.moveTo(0, -size * 0.2)
+        path.cubicTo(size * 0.8, -size * 0.8, size, size * 0.3, 0, size * 0.8)
+        painter.drawPath(path)
         painter.restore()
 
     def _draw_sparkle(self, painter: QtGui.QPainter, x: float, y: float, color: str, alpha: int) -> None:
@@ -257,28 +312,33 @@ class CuteButton(QtWidgets.QPushButton):
     def _apply_style(self) -> None:
         if not self.isEnabled():
             bg = self.disabled
-            color = "#F8F4F8"
+            color = "#A0A0A0"
+            border_color = self._mix(bg, "#FFFFFF", 0.3)
         elif self._pressed:
             bg = self.pressed
             color = self.foreground
+            border_color = self._mix(bg, "#2B3A55", 0.15)
         elif self._hovered:
             bg = self.hover
             color = self.foreground
+            border_color = self._mix(bg, "#2B3A55", 0.10)
         else:
             bg = self.base
             color = self.foreground
+            border_color = self._mix(bg, "#2B3A55", 0.05)
+        
         self.setStyleSheet(
             f"""
             QPushButton {{
                 background-color: {bg};
                 color: {color};
-                border: 1px solid {self._mix(bg, "#2B3A55", 0.10)};
+                border: 2px solid {border_color};
                 border-radius: {self.radius}px;
-                font-weight: 700;
+                font-weight: 800;
                 padding: 8px 18px;
             }}
             QPushButton:disabled {{
-                color: #F8F4F8;
+                color: #A0A0A0;
             }}
             """
         )
@@ -422,29 +482,31 @@ class VCStudioApp(QtWidgets.QMainWindow):
         self.metric_underflow_var = TextValue("-")
 
     def _configure_style(self) -> None:
-        self.qt_app.setFont(QtGui.QFont("Arial", 10))
+        self.qt_app.setFont(QtGui.QFont("Nunito", 11))
         self.qt_app.setStyleSheet(
             f"""
             * {{
                 color: {self.colors["text"]};
-                font-family: "Avenir Next", "Helvetica Neue", Arial;
+                font-family: "Nunito", "Quicksand", "Varela Round", "Comic Sans MS", "Avenir Next Rounded", "Helvetica Neue", Arial;
                 font-size: 13px;
-                letter-spacing: 0px;
+                letter-spacing: 0.5px;
             }}
             QMainWindow#MainWindow {{
                 background: {self.colors["bg"]};
             }}
             QLabel#Title {{
                 font-size: 28px;
-                font-weight: 800;
-                color: {self.colors["text"]};
+                font-weight: 900;
+                color: {self.colors["pink_strong"]};
             }}
             QLabel#Subtitle, QLabel#Muted {{
                 color: {self.colors["muted"]};
+                font-weight: 600;
             }}
             QLabel#SectionTitle {{
                 font-size: 16px;
-                font-weight: 800;
+                font-weight: 900;
+                color: {self.colors["text"]};
             }}
             QLabel#SmallTitle {{
                 font-size: 14px;
@@ -452,133 +514,151 @@ class VCStudioApp(QtWidgets.QMainWindow):
             }}
             QLabel#ParamHelp {{
                 color: {self.colors["muted"]};
-                font-size: 11px;
-                font-weight: 500;
+                font-size: 12px;
+                font-weight: 600;
             }}
             QToolButton#DisclosureButton {{
                 background-color: {self.colors["surface_alt"]};
-                border: 1px solid {self.colors["sky_soft"]};
-                border-radius: 13px;
-                padding: 9px 12px;
+                border: 2px solid {self.colors["sky_soft"]};
+                border-radius: 16px;
+                padding: 10px 14px;
                 color: {self.colors["text"]};
                 font-weight: 800;
                 text-align: left;
             }}
             QToolButton#DisclosureButton:hover {{
                 background-color: {self.colors["purple"]};
+                border-color: {self.colors["purple_strong"]};
             }}
             QFrame#AdvancedBody {{
-                background-color: rgba(255, 247, 250, 160);
-                border: 1px solid {self.colors["line"]};
-                border-radius: 16px;
+                background-color: rgba(255, 255, 255, 180);
+                border: 2px dashed {self.colors["line"]};
+                border-radius: 20px;
             }}
             QLabel#StatusText {{
                 font-weight: 800;
                 color: {self.colors["text"]};
             }}
             QFrame#HeroPanel {{
-                background-color: rgba(255, 247, 250, 214);
-                border: 1px solid {self.colors["pink"]};
-                border-radius: 26px;
+                background-color: rgba(255, 255, 255, 160);
+                border: 2px solid {self.colors["pink"]};
+                border-radius: 30px;
             }}
             QFrame#SidePanel, QFrame#LogPanel {{
-                background-color: rgba(255, 247, 250, 232);
-                border: 1px solid {self.colors["line"]};
-                border-radius: 24px;
+                background-color: rgba(255, 255, 255, 160);
+                border: 2px solid {self.colors["line"]};
+                border-radius: 26px;
             }}
             QFrame#Card {{
-                background-color: rgba(255, 252, 245, 238);
-                border: 1px solid {self.colors["line"]};
-                border-radius: 20px;
+                background-color: rgba(255, 255, 255, 170);
+                border: 2px solid {self.colors["line"]};
+                border-radius: 24px;
             }}
             QFrame#MetricCard {{
-                background-color: rgba(255, 252, 245, 245);
-                border: 1px solid {self.colors["line"]};
-                border-radius: 18px;
+                background-color: rgba(255, 255, 255, 180);
+                border: 2px solid {self.colors["pink"]};
+                border-radius: 20px;
+                margin: 4px;
             }}
             QLabel#MetricName {{
                 color: {self.colors["muted"]};
-                font-size: 11px;
-                font-weight: 650;
+                font-size: 12px;
+                font-weight: 700;
+                text-transform: uppercase;
             }}
             QLabel#MetricValue {{
-                color: {self.colors["text"]};
-                font-size: 19px;
-                font-weight: 850;
+                color: {self.colors["pink_strong"]};
+                font-size: 22px;
+                font-weight: 900;
             }}
             QFrame#StatusPill {{
                 background-color: {self.colors["mint"]};
-                border: 1px solid {self.colors["mint_strong"]};
-                border-radius: 17px;
+                border: 2px solid {self.colors["mint_strong"]};
+                border-radius: 20px;
             }}
             QFrame#AccentStrip {{
-                background-color: {self.colors["pink"]};
-                border-radius: 4px;
+                background-color: {self.colors["pink_strong"]};
+                border-radius: 6px;
             }}
             QLineEdit, QComboBox {{
                 background-color: {self.colors["field"]};
-                border: 1px solid {self.colors["line"]};
-                border-radius: 13px;
-                padding: 7px 11px;
-                min-height: 20px;
+                border: 2px solid {self.colors["line"]};
+                border-radius: 16px;
+                padding: 8px 14px;
+                min-height: 22px;
                 selection-background-color: {self.colors["pink"]};
+                font-weight: 600;
             }}
             QLineEdit:focus, QComboBox:focus {{
-                border: 1px solid {self.colors["sky"]};
-                background-color: {self.colors["surface_alt"]};
+                border: 2px solid {self.colors["sky"]};
+                background-color: #FFFFFF;
             }}
             QComboBox::drop-down {{
                 border: none;
-                width: 26px;
+                width: 28px;
             }}
-            QComboBox QAbstractItemView {{
+            QComboBox::down-arrow {{
+                image: none;
+            }}
+            QFrame#ComboPopupContainer {{
+                background: transparent;
+                border: none;
+            }}
+            QComboBox QAbstractItemView, QListView#ComboPopupView {{
                 background-color: {self.colors["field"]};
-                border: 1px solid {self.colors["line"]};
-                border-radius: 10px;
-                padding: 6px;
+                border: 2px solid {self.colors["line"]};
+                border-radius: 12px;
+                padding: 8px;
                 selection-background-color: {self.colors["pink"]};
                 outline: none;
             }}
             QPushButton#GhostButton {{
                 background-color: {self.colors["surface_alt"]};
-                border: 1px solid {self.colors["sky_soft"]};
-                border-radius: 13px;
-                padding: 8px 14px;
-                font-weight: 700;
+                border: 2px solid {self.colors["sky_soft"]};
+                border-radius: 16px;
+                padding: 8px 16px;
+                font-weight: 800;
+                color: {self.colors["text"]};
             }}
             QPushButton#GhostButton:hover {{
                 background-color: {self.colors["sky"]};
+                border-color: {self.colors["sky"]};
+                color: #FFFFFF;
             }}
             QPushButton#GhostButton:pressed {{
                 background-color: {self.colors["sky_soft"]};
             }}
             QPushButton#GhostButton:disabled {{
                 background-color: {self.colors["disabled"]};
-                color: #F8F4F8;
+                border-color: {self.colors["disabled"]};
+                color: #FFFFFF;
             }}
             QTabWidget::pane {{
-                border: 1px solid {self.colors["line"]};
-                border-radius: 22px;
-                background-color: rgba(255, 247, 250, 224);
-                top: -1px;
+                border: 2px solid {self.colors["line"]};
+                border-radius: 26px;
+                background-color: rgba(255, 255, 255, 160);
+                margin-top: -2px;
             }}
             QTabBar::tab {{
                 background-color: {self.colors["surface_alt"]};
-                border: 1px solid {self.colors["line"]};
+                border: 2px solid {self.colors["line"]};
                 border-bottom: none;
-                border-top-left-radius: 15px;
-                border-top-right-radius: 15px;
-                padding: 10px 20px;
-                margin-right: 6px;
+                border-top-left-radius: 18px;
+                border-top-right-radius: 18px;
+                padding: 12px 24px;
+                margin-right: 8px;
                 color: {self.colors["muted"]};
-                font-weight: 750;
+                font-weight: 800;
             }}
             QTabBar::tab:selected {{
                 background-color: {self.colors["pink"]};
+                border-color: {self.colors["pink_strong"]};
                 color: {self.colors["text"]};
+                margin-top: -2px;
             }}
             QTabBar::tab:hover:!selected {{
                 background-color: {self.colors["purple"]};
+                border-color: {self.colors["purple_strong"]};
             }}
             QScrollArea {{
                 background: transparent;
@@ -589,48 +669,56 @@ class VCStudioApp(QtWidgets.QMainWindow):
                 border: none;
             }}
             QWidget#TabViewport {{
-                background: {self.colors["surface_alt"]};
+                background: transparent;
             }}
             QTextEdit {{
                 background-color: {self.colors["field"]};
-                border: 1px solid {self.colors["line"]};
-                border-radius: 18px;
-                padding: 10px;
+                border: 2px solid {self.colors["line"]};
+                border-radius: 20px;
+                padding: 14px;
                 selection-background-color: {self.colors["pink"]};
-                font-family: "Menlo", "Consolas";
+                font-family: "Menlo", "Consolas", monospace;
                 font-size: 12px;
+                color: {self.colors["text"]};
             }}
             QCheckBox {{
-                spacing: 10px;
-                font-weight: 650;
+                spacing: 12px;
+                font-weight: 700;
                 color: {self.colors["muted"]};
             }}
             QCheckBox:checked {{
                 color: {self.colors["text"]};
             }}
             QCheckBox::indicator {{
-                width: 18px;
-                height: 18px;
-                border-radius: 9px;
-                border: 1px solid {self.colors["line"]};
+                width: 22px;
+                height: 22px;
+                border-radius: 11px;
+                border: 2px solid {self.colors["line"]};
                 background-color: {self.colors["field"]};
+            }}
+            QCheckBox::indicator:hover {{
+                border: 2px solid {self.colors["pink"]};
             }}
             QCheckBox::indicator:checked {{
                 background-color: {self.colors["mint"]};
-                border: 1px solid {self.colors["mint_strong"]};
+                border: 2px solid {self.colors["mint_strong"]};
+                image: none;
             }}
             QSplitter::handle {{
                 background: transparent;
             }}
             QScrollBar:vertical {{
                 background: transparent;
-                width: 12px;
+                width: 14px;
                 margin: 8px 2px 8px 2px;
             }}
             QScrollBar::handle:vertical {{
-                background: {self.colors["purple"]};
+                background: {self.colors["pink"]};
                 border-radius: 5px;
-                min-height: 28px;
+                min-height: 32px;
+            }}
+            QScrollBar::handle:vertical:hover {{
+                background: {self.colors["pink_strong"]};
             }}
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
                 height: 0px;
@@ -716,7 +804,7 @@ class VCStudioApp(QtWidgets.QMainWindow):
         layout.setContentsMargins(16, 14, 16, 16)
         layout.setSpacing(9)
         title_row = QtWidgets.QHBoxLayout()
-        title_row.addWidget(self._section_title("Run Log", self.colors["sky"]))
+        title_row.addWidget(self._section_title("📝 Run Log", self.colors["sky"]))
         title_row.addStretch(1)
         layout.addLayout(title_row)
         self.log_text = QtWidgets.QTextEdit()
@@ -729,11 +817,11 @@ class VCStudioApp(QtWidgets.QMainWindow):
         layout = QtWidgets.QVBoxLayout(parent)
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(14)
-        layout.addWidget(self._section_title("Model", self.colors["pink"]))
+        layout.addWidget(self._section_title("🌸 Model", self.colors["pink"]))
 
         form = QtWidgets.QGridLayout()
         form.setHorizontalSpacing(8)
-        form.setVerticalSpacing(10)
+        form.setVerticalSpacing(16)
         form.setColumnStretch(1, 1)
         row = 0
         row = self._path_row(form, row, "Model dir", self.model_dir_var, "directory")
@@ -748,9 +836,9 @@ class VCStudioApp(QtWidgets.QMainWindow):
         divider.setStyleSheet(f"color: {self.colors['line']};")
         layout.addWidget(divider)
 
-        layout.addWidget(self._section_title("Metrics", self.colors["mint"]))
+        layout.addWidget(self._section_title("✨ Metrics", self.colors["mint"]))
         metrics = QtWidgets.QGridLayout()
-        metrics.setSpacing(10)
+        metrics.setSpacing(16)
         metrics.setColumnStretch(0, 1)
         metrics.setColumnStretch(1, 1)
         self._metric_card(metrics, 0, 0, "Chunk", self.metric_chunk_var, self.colors["pink"])
@@ -763,7 +851,7 @@ class VCStudioApp(QtWidgets.QMainWindow):
 
     def _build_realtime_tab(self, notebook: QtWidgets.QTabWidget) -> None:
         content = QtWidgets.QWidget()
-        self._fill_widget(content, self.colors["surface_alt"])
+        content.setStyleSheet("background: transparent;")
         layout = QtWidgets.QVBoxLayout(content)
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(14)
@@ -774,7 +862,7 @@ class VCStudioApp(QtWidgets.QMainWindow):
         audio_layout.setHorizontalSpacing(10)
         audio_layout.setVerticalSpacing(12)
         audio_layout.setColumnStretch(1, 1)
-        audio_layout.addWidget(self._section_title("Audio I/O", self.colors["sky"]), 0, 0, 1, 3)
+        audio_layout.addWidget(self._section_title("🎧 Audio I/O", self.colors["sky"]), 0, 0, 1, 3)
         audio_layout.addWidget(self._field_label("Input"), 1, 0)
         self.input_device_combo = QtWidgets.QComboBox()
         self._bind_combo(self.input_device_combo, self.input_device_var, ["Default"])
@@ -791,11 +879,11 @@ class VCStudioApp(QtWidgets.QMainWindow):
         control_layout = QtWidgets.QVBoxLayout(control_card)
         control_layout.setContentsMargins(18, 18, 18, 18)
         control_layout.setSpacing(14)
-        control_layout.addWidget(self._section_title("Live Control", self.colors["pink"]))
+        control_layout.addWidget(self._section_title("🎀 Live Control", self.colors["pink"]))
         buttons = QtWidgets.QHBoxLayout()
         buttons.setSpacing(10)
         self.start_live_button = CuteButton(
-            "Start Live",
+            "✨ Start Live",
             self._start_realtime,
             base=self.colors["mint"],
             hover=self.colors["mint_strong"],
@@ -803,7 +891,7 @@ class VCStudioApp(QtWidgets.QMainWindow):
             min_width=132,
         )
         self.stop_live_button = CuteButton(
-            "Stop",
+            "🛑 Stop",
             self._stop_realtime,
             base=self.colors["danger"],
             hover=self.colors["danger_hover"],
@@ -825,11 +913,11 @@ class VCStudioApp(QtWidgets.QMainWindow):
         layout.addWidget(control_card)
         layout.addStretch(1)
 
-        notebook.addTab(self._scroll(content), "Realtime")
+        notebook.addTab(self._scroll(content), "🎙️ Realtime")
 
     def _build_offline_tab(self, notebook: QtWidgets.QTabWidget) -> None:
         content = QtWidgets.QWidget()
-        self._fill_widget(content, self.colors["surface_alt"])
+        content.setStyleSheet("background: transparent;")
         layout = QtWidgets.QVBoxLayout(content)
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(14)
@@ -840,7 +928,7 @@ class VCStudioApp(QtWidgets.QMainWindow):
         grid.setHorizontalSpacing(8)
         grid.setVerticalSpacing(10)
         grid.setColumnStretch(1, 1)
-        grid.addWidget(self._section_title("Benchmark Job", self.colors["purple"]), 0, 0, 1, 3)
+        grid.addWidget(self._section_title("🚀 Benchmark Job", self.colors["purple"]), 0, 0, 1, 3)
         row = 1
         row = self._path_row(grid, row, "Source wav", self.source_var, "open_wav")
         row = self._path_row(grid, row, "Output wav", self.output_var, "save_wav")
@@ -852,7 +940,7 @@ class VCStudioApp(QtWidgets.QMainWindow):
         controls_layout.setContentsMargins(18, 18, 18, 18)
         controls_layout.setSpacing(10)
         self.run_offline_button = CuteButton(
-            "Run Benchmark",
+            "🚀 Run Benchmark",
             self._start_offline,
             base=self.colors["sky"],
             hover=self.colors["sky_soft"],
@@ -860,7 +948,7 @@ class VCStudioApp(QtWidgets.QMainWindow):
             min_width=158,
         )
         self.stop_offline_button = CuteButton(
-            "Stop",
+            "🛑 Stop",
             self._stop_offline,
             base=self.colors["danger"],
             hover=self.colors["danger_hover"],
@@ -875,11 +963,11 @@ class VCStudioApp(QtWidgets.QMainWindow):
         layout.addWidget(controls)
         layout.addStretch(1)
 
-        notebook.addTab(self._scroll(content), "Offline Benchmark")
+        notebook.addTab(self._scroll(content), "📊 Offline Benchmark")
 
     def _build_parameters_tab(self, notebook: QtWidgets.QTabWidget) -> None:
         content = QtWidgets.QWidget()
-        self._fill_widget(content, self.colors["surface_alt"])
+        content.setStyleSheet("background: transparent;")
         layout = QtWidgets.QHBoxLayout(content)
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(14)
@@ -888,7 +976,7 @@ class VCStudioApp(QtWidgets.QMainWindow):
         timing_layout = QtWidgets.QVBoxLayout(timing)
         timing_layout.setContentsMargins(18, 18, 18, 18)
         timing_layout.setSpacing(12)
-        timing_layout.addWidget(self._section_title("Timing", self.colors["cream"]))
+        timing_layout.addWidget(self._section_title("⏱️ Timing", self.colors["cream"]))
         timing_form = QtWidgets.QFormLayout()
         timing_form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
         timing_form.setFormAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
@@ -947,7 +1035,7 @@ class VCStudioApp(QtWidgets.QMainWindow):
         quality_layout = QtWidgets.QVBoxLayout(quality)
         quality_layout.setContentsMargins(18, 16, 18, 16)
         quality_layout.setSpacing(9)
-        quality_layout.addWidget(self._section_title("Quality / Runtime", self.colors["mint"]))
+        quality_layout.addWidget(self._section_title("💎 Quality / Runtime", self.colors["mint"]))
         quality_form = QtWidgets.QFormLayout()
         quality_form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
         quality_form.setFormAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
@@ -1040,7 +1128,7 @@ class VCStudioApp(QtWidgets.QMainWindow):
         quality_layout.addStretch(1)
         layout.addWidget(quality, 1)
 
-        notebook.addTab(self._scroll(content), "Parameters")
+        notebook.addTab(self._scroll(content), "⚙️ Parameters")
 
     def _card(self) -> QtWidgets.QFrame:
         card = QtWidgets.QFrame()
@@ -1058,7 +1146,7 @@ class VCStudioApp(QtWidgets.QMainWindow):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         scroll.viewport().setObjectName("TabViewport")
-        self._fill_widget(scroll.viewport(), self.colors["surface_alt"])
+        scroll.viewport().setStyleSheet("background: transparent;")
         scroll.setWidget(content)
         return scroll
 
@@ -1241,7 +1329,59 @@ class VCStudioApp(QtWidgets.QMainWindow):
         field.textChanged.connect(variable.set)
         variable.changed.connect(lambda value, widget=field: self._set_line_text(widget, value))
 
+    def _style_combo_popup(self, view: QtWidgets.QAbstractItemView) -> None:
+        view.setObjectName("ComboPopupView")
+        view.setStyleSheet(
+            f"""
+            QListView#ComboPopupView {{
+                background-color: {self.colors["field"]};
+                border: 2px solid {self.colors["line"]};
+                border-radius: 12px;
+                padding: 8px;
+                selection-background-color: {self.colors["pink"]};
+                outline: none;
+            }}
+            QListView#ComboPopupView::item {{
+                background: transparent;
+                border: none;
+                min-height: 28px;
+                padding: 8px 12px;
+            }}
+            QListView#ComboPopupView::item:hover {{
+                background-color: {self.colors["surface"]};
+            }}
+            QListView#ComboPopupView::item:selected {{
+                background-color: {self.colors["pink"]};
+                border: 1px solid {self.colors["pink_strong"]};
+            }}
+            """
+        )
+
     def _bind_combo(self, combo: QtWidgets.QComboBox, variable: TextValue, values: list[str]) -> None:
+        view = combo.view()
+        if view:
+            self._style_combo_popup(view)
+            view.setContentsMargins(0, 0, 0, 0)
+            popup = view.window()
+            if popup:
+                popup.setObjectName("ComboPopupContainer")
+                popup.setStyleSheet("QFrame#ComboPopupContainer { background: transparent; border: none; }")
+                if isinstance(popup, QtWidgets.QFrame):
+                    popup.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+                    popup.setLineWidth(0)
+                    popup.setMidLineWidth(0)
+                popup.setContentsMargins(0, 0, 0, 0)
+                layout = popup.layout()
+                if layout:
+                    layout.setContentsMargins(0, 0, 0, 0)
+                    layout.setSpacing(0)
+                popup.setWindowFlags(
+                    QtCore.Qt.WindowType.Popup
+                    | QtCore.Qt.WindowType.FramelessWindowHint
+                    | QtCore.Qt.WindowType.NoDropShadowWindowHint
+                )
+                popup.setAutoFillBackground(False)
+                popup.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground, True)
         combo.addItems(values)
         if variable.get() in values:
             combo.setCurrentText(variable.get())
