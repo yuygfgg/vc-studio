@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import math
 import queue
+import sys
 import threading
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Callable
+
+from PyQt6 import QtCore, QtGui, QtWidgets
 
 from vc_studio_backend import (
     BackendConfig,
@@ -16,206 +19,348 @@ from vc_studio_backend import (
 )
 
 
-def rounded_rect(canvas, x1: int, y1: int, x2: int, y2: int, radius: int, **kwargs) -> int:
-    radius = min(radius, max(0, (x2 - x1) // 2), max(0, (y2 - y1) // 2))
-    points = [
-        x1 + radius, y1,
-        x2 - radius, y1,
-        x2, y1,
-        x2, y1 + radius,
-        x2, y2 - radius,
-        x2, y2,
-        x2 - radius, y2,
-        x1 + radius, y2,
-        x1, y2,
-        x1, y2 - radius,
-        x1, y1 + radius,
-        x1, y1,
-    ]
-    return canvas.create_polygon(points, smooth=True, splinesteps=18, **kwargs)
+PALETTE = {
+    "bg": "#FAF9F6",
+    "surface": "#FFF7FA",
+    "surface_alt": "#F5FBFF",
+    "panel": "#FFF2F6",
+    "card": "#FFFCF5",
+    "field": "#FFFDF8",
+    "text": "#2B3A55",
+    "muted": "#6F7891",
+    "line": "#E8DCEF",
+    "pink": "#FFD1DC",
+    "pink_strong": "#FFB7B2",
+    "mint": "#B5EAD7",
+    "mint_strong": "#A0E8AF",
+    "sky": "#A2D2FF",
+    "sky_soft": "#C7CEEA",
+    "cream": "#FFDAC1",
+    "yellow": "#FDFD96",
+    "purple": "#E2C6FF",
+    "purple_strong": "#CDB4DB",
+    "danger": "#F28B82",
+    "danger_hover": "#E57373",
+    "disabled": "#D8D2DA",
+}
 
 
-class RoundedButton:
+class TextValue(QtCore.QObject):
+    changed = QtCore.pyqtSignal(str)
+
+    def __init__(self, value: str = ""):
+        super().__init__()
+        self._value = value
+
+    def get(self) -> str:
+        return self._value
+
+    def set(self, value: str) -> None:
+        value = str(value)
+        if value == self._value:
+            return
+        self._value = value
+        self.changed.emit(value)
+
+
+class BoolValue(QtCore.QObject):
+    changed = QtCore.pyqtSignal(bool)
+
+    def __init__(self, value: bool = False):
+        super().__init__()
+        self._value = bool(value)
+
+    def get(self) -> bool:
+        return self._value
+
+    def set(self, value: bool) -> None:
+        value = bool(value)
+        if value == self._value:
+            return
+        self._value = value
+        self.changed.emit(value)
+
+
+class KawaiiBackdrop(QtWidgets.QWidget):
+    def __init__(self, colors: dict[str, str]):
+        super().__init__()
+        self.colors = colors
+        self.phase = 0.0
+        self.petals = [
+            (0.06, 0.08, 0.16, 10, colors["pink"]),
+            (0.18, 0.62, 0.10, 8, colors["cream"]),
+            (0.34, 0.22, 0.14, 7, colors["purple"]),
+            (0.52, 0.78, 0.12, 9, colors["mint"]),
+            (0.71, 0.14, 0.09, 8, colors["sky"]),
+            (0.84, 0.54, 0.13, 10, colors["pink_strong"]),
+            (0.94, 0.30, 0.11, 7, colors["cream"]),
+        ]
+        self.sparkles = [
+            (0.12, 0.35, colors["sky"]),
+            (0.27, 0.12, colors["mint"]),
+            (0.48, 0.48, colors["purple"]),
+            (0.69, 0.28, colors["pink"]),
+            (0.88, 0.75, colors["cream"]),
+        ]
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self._tick)
+        self.timer.start(80)
+
+    def _tick(self) -> None:
+        self.phase = (self.phase + 0.006) % 1.0
+        self.update()
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QtGui.QColor(self.colors["bg"]))
+
+        width = self.width()
+        height = self.height()
+        self._draw_wave(painter, width, height, self.colors["surface"], 0.08, 0.23)
+        self._draw_wave(painter, width, height, self.colors["surface_alt"], 0.16, 0.30)
+
+        for x_frac, y_frac, speed, size, color in self.petals:
+            x = x_frac * width + 14 * math.sin((self.phase + x_frac) * math.tau)
+            y = (y_frac + self.phase * speed) % 1.05 * height - 20
+            self._draw_petal(painter, x, y, size, color, self.phase * 180 + x_frac * 90)
+
+        for x_frac, y_frac, color in self.sparkles:
+            alpha = 70 + int(45 * (1 + math.sin((self.phase + x_frac) * math.tau)))
+            self._draw_sparkle(painter, x_frac * width, y_frac * height, color, alpha)
+
+    def _draw_wave(
+        self,
+        painter: QtGui.QPainter,
+        width: int,
+        height: int,
+        color: str,
+        top: float,
+        depth: float,
+    ) -> None:
+        path = QtGui.QPainterPath()
+        path.moveTo(0, top * height)
+        path.cubicTo(width * 0.22, depth * height, width * 0.46, top * height, width * 0.68, depth * height)
+        path.cubicTo(width * 0.84, (top + 0.08) * height, width, depth * height, width, top * height)
+        path.lineTo(width, 0)
+        path.lineTo(0, 0)
+        path.closeSubpath()
+        fill = QtGui.QColor(color)
+        fill.setAlpha(150)
+        painter.fillPath(path, fill)
+
+    def _draw_petal(self, painter: QtGui.QPainter, x: float, y: float, size: int, color: str, angle: float) -> None:
+        painter.save()
+        painter.translate(x, y)
+        painter.rotate(angle)
+        fill = QtGui.QColor(color)
+        fill.setAlpha(92)
+        painter.setBrush(fill)
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        painter.drawEllipse(QtCore.QRectF(-size * 0.42, -size * 0.18, size * 0.84, size * 1.28))
+        painter.restore()
+
+    def _draw_sparkle(self, painter: QtGui.QPainter, x: float, y: float, color: str, alpha: int) -> None:
+        pen_color = QtGui.QColor(color)
+        pen_color.setAlpha(alpha)
+        painter.setPen(QtGui.QPen(pen_color, 2, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap))
+        painter.drawLine(QtCore.QPointF(x - 5, y), QtCore.QPointF(x + 5, y))
+        painter.drawLine(QtCore.QPointF(x, y - 5), QtCore.QPointF(x, y + 5))
+
+
+class CuteButton(QtWidgets.QPushButton):
     def __init__(
         self,
-        parent,
         text: str,
-        command: Callable[[], None],
+        command,
         *,
-        width: int = 128,
-        height: int = 38,
-        radius: int = 16,
-        fill: str,
-        hover_fill: str,
-        disabled_fill: str,
-        foreground: str,
-        background: str,
-        font: tuple[str, int, str] = ("Helvetica", 11, "bold"),
+        base: str,
+        hover: str,
+        disabled: str,
+        foreground: str = "#2B3A55",
+        radius: int = 15,
+        min_width: int = 96,
+        height: int = 42,
+        parent: QtWidgets.QWidget | None = None,
     ):
-        import tkinter as tk
-
-        self.canvas = tk.Canvas(
-            parent,
-            width=width,
-            height=height,
-            bg=background,
-            highlightthickness=0,
-            bd=0,
-            cursor="hand2",
-        )
-        self.text = text
-        self.command = command
-        self.width = width
-        self.height = height
-        self.radius = radius
-        self.fill = fill
-        self.hover_fill = hover_fill
-        self.disabled_fill = disabled_fill
+        super().__init__(text, parent)
+        self.base = base
+        self.hover = hover
+        self.pressed = self._mix(base, "#CDB4DB", 0.28)
+        self.disabled = disabled
         self.foreground = foreground
-        self.background = background
-        self.font = font
-        self.state = "normal"
-        self.hover = False
-        self.canvas.bind("<Enter>", self._on_enter)
-        self.canvas.bind("<Leave>", self._on_leave)
-        self.canvas.bind("<Button-1>", self._on_click)
-        self._draw()
+        self.radius = radius
+        self._hovered = False
+        self._pressed = False
+        self.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        self.setMinimumSize(min_width, height)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)
+        self.clicked.connect(command)
 
-    def grid(self, *args, **kwargs):
-        return self.canvas.grid(*args, **kwargs)
-
-    def pack(self, *args, **kwargs):
-        return self.canvas.pack(*args, **kwargs)
+        self.shadow = QtWidgets.QGraphicsDropShadowEffect(self)
+        self.shadow.setBlurRadius(8)
+        self.shadow.setOffset(0, 4)
+        self.shadow.setColor(QtGui.QColor(214, 159, 183, 85))
+        self.setGraphicsEffect(self.shadow)
+        self.shadow_animation = QtCore.QPropertyAnimation(self.shadow, b"blurRadius", self)
+        self.shadow_animation.setDuration(150)
+        self.shadow_animation.setEasingCurve(QtCore.QEasingCurve.Type.OutCubic)
+        self._apply_style()
 
     def configure(self, cnf=None, **kwargs) -> None:
         if cnf:
             kwargs.update(cnf)
         if "state" in kwargs:
-            self.state = kwargs.pop("state")
-            self.canvas.configure(cursor="" if self.state == "disabled" else "hand2")
-            self._draw()
+            self.setEnabled(kwargs.pop("state") != "disabled")
         if "text" in kwargs:
-            self.text = kwargs.pop("text")
-            self._draw()
-        if kwargs:
-            self.canvas.configure(**kwargs)
+            self.setText(str(kwargs.pop("text")))
+        self._apply_style()
 
     config = configure
 
-    def _draw(self) -> None:
-        self.canvas.delete("all")
-        fill = self.disabled_fill if self.state == "disabled" else self.hover_fill if self.hover else self.fill
-        text_fill = "#f8faf8" if self.state != "disabled" else "#d5d3cb"
-        rounded_rect(self.canvas, 1, 1, self.width - 1, self.height - 1, self.radius, fill=fill, outline="")
-        self.canvas.create_text(
-            self.width // 2,
-            self.height // 2,
-            text=self.text,
-            fill=text_fill if self.foreground == "#ffffff" else self.foreground,
-            font=self.font,
+    def enterEvent(self, event: QtCore.QEvent) -> None:
+        self._hovered = True
+        self._animate_shadow(18)
+        self._apply_style()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event: QtCore.QEvent) -> None:
+        self._hovered = False
+        self._pressed = False
+        self._animate_shadow(8)
+        self._apply_style()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        self._pressed = True
+        self._animate_shadow(4)
+        self._apply_style()
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        self._pressed = False
+        self._animate_shadow(18 if self._hovered else 8)
+        self._apply_style()
+        super().mouseReleaseEvent(event)
+
+    def changeEvent(self, event: QtCore.QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() == QtCore.QEvent.Type.EnabledChange:
+            self._apply_style()
+
+    def _animate_shadow(self, radius: int) -> None:
+        self.shadow_animation.stop()
+        self.shadow_animation.setStartValue(self.shadow.blurRadius())
+        self.shadow_animation.setEndValue(radius)
+        self.shadow_animation.start()
+
+    def _apply_style(self) -> None:
+        if not self.isEnabled():
+            bg = self.disabled
+            color = "#F8F4F8"
+        elif self._pressed:
+            bg = self.pressed
+            color = self.foreground
+        elif self._hovered:
+            bg = self.hover
+            color = self.foreground
+        else:
+            bg = self.base
+            color = self.foreground
+        self.setStyleSheet(
+            f"""
+            QPushButton {{
+                background-color: {bg};
+                color: {color};
+                border: 1px solid {self._mix(bg, "#2B3A55", 0.10)};
+                border-radius: {self.radius}px;
+                font-weight: 700;
+                padding: 8px 18px;
+            }}
+            QPushButton:disabled {{
+                color: #F8F4F8;
+            }}
+            """
         )
 
-    def _on_enter(self, event) -> None:
-        self.hover = True
-        self._draw()
+    @staticmethod
+    def _mix(left: str, right: str, amount: float) -> str:
+        left_color = QtGui.QColor(left)
+        right_color = QtGui.QColor(right)
+        inv = 1.0 - amount
+        return "#{:02X}{:02X}{:02X}".format(
+            round(left_color.red() * inv + right_color.red() * amount),
+            round(left_color.green() * inv + right_color.green() * amount),
+            round(left_color.blue() * inv + right_color.blue() * amount),
+        )
 
-    def _on_leave(self, event) -> None:
-        self.hover = False
-        self._draw()
 
-    def _on_click(self, event) -> None:
-        if self.state != "disabled":
-            self.command()
-
-
-class MetricCard:
-    def __init__(
-        self,
-        parent,
-        name: str,
-        variable,
-        *,
-        colors: dict[str, str],
-        width: int = 142,
-        height: int = 78,
-    ):
-        import tkinter as tk
-
-        self.variable = variable
-        self.name = name
+class MetricCard(QtWidgets.QFrame):
+    def __init__(self, name: str, variable: TextValue, colors: dict[str, str], accent: str):
+        super().__init__()
         self.colors = colors
-        self.width = width
-        self.height = height
-        self.canvas = tk.Canvas(
-            parent,
-            width=width,
-            height=height,
-            bg=colors["panel"],
-            highlightthickness=0,
-            bd=0,
-        )
-        self.variable.trace_add("write", lambda *_: self._draw())
-        self.canvas.bind("<Configure>", self._on_configure)
-        self._draw()
+        self.accent = accent
+        self.setObjectName("MetricCard")
+        self.setMinimumHeight(68)
+        self.setMaximumHeight(76)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
 
-    def grid(self, *args, **kwargs):
-        return self.canvas.grid(*args, **kwargs)
+        self.shadow = QtWidgets.QGraphicsDropShadowEffect(self)
+        self.shadow.setBlurRadius(7)
+        self.shadow.setOffset(0, 3)
+        shadow_color = QtGui.QColor(accent)
+        shadow_color.setAlpha(78)
+        self.shadow.setColor(shadow_color)
+        self.shadow.setEnabled(True)
+        self.setGraphicsEffect(self.shadow)
 
-    def _on_configure(self, event) -> None:
-        self.width = max(1, event.width)
-        self.height = max(1, event.height)
-        self._draw()
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(15, 10, 15, 10)
+        layout.setSpacing(3)
+        title = QtWidgets.QLabel(name)
+        title.setObjectName("MetricName")
+        self.value_label = QtWidgets.QLabel(variable.get())
+        self.value_label.setObjectName("MetricValue")
+        layout.addWidget(title)
+        layout.addWidget(self.value_label)
 
-    def _draw(self) -> None:
-        self.canvas.delete("all")
-        rounded_rect(
-            self.canvas,
-            1,
-            1,
-            self.width - 1,
-            self.height - 1,
-            14,
-            fill=self.colors["card"],
-            outline=self.colors["line"],
-            width=1,
-        )
-        self.canvas.create_text(
-            16,
-            18,
-            text=self.name,
-            fill=self.colors["muted"],
-            anchor="w",
-            font=("Helvetica", 10),
-        )
-        self.canvas.create_text(
-            16,
-            48,
-            text=self.variable.get(),
-            fill=self.colors["text"],
-            anchor="w",
-            font=("Helvetica", 19, "bold"),
-        )
+        self.pulse = QtCore.QPropertyAnimation(self.shadow, b"blurRadius", self)
+        self.pulse.setDuration(260)
+        self.pulse.setKeyValueAt(0.0, 7)
+        self.pulse.setKeyValueAt(0.45, 17)
+        self.pulse.setKeyValueAt(1.0, 7)
+        self.pulse.setEasingCurve(QtCore.QEasingCurve.Type.OutCubic)
+        variable.changed.connect(self.set_value)
+
+    def set_value(self, value: str) -> None:
+        self.value_label.setText(value)
+        self.pulse.stop()
+        self.pulse.start()
 
 
 def launch_gui(args: argparse.Namespace) -> None:
-    app = VCStudioApp(args)
-    app.mainloop()
+    qt_app = QtWidgets.QApplication.instance()
+    created_app = qt_app is None
+    if qt_app is None:
+        qt_app = QtWidgets.QApplication(sys.argv[:1])
+    qt_app.setApplicationName("CosyVoice VC Studio")
+    qt_app.setStyle("Fusion")
+    window = VCStudioApp(args, qt_app)
+    qt_app._vc_studio_window = window
+    window.show()
+    if created_app:
+        qt_app.exec()
 
 
-class VCStudioApp:
-    def __init__(self, args: argparse.Namespace):
-        import tkinter as tk
-        from tkinter import filedialog, messagebox, ttk
-
-        self.tk = tk
-        self.ttk = ttk
-        self.filedialog = filedialog
-        self.messagebox = messagebox
-        self.root = tk.Tk()
-        self.root.title("CosyVoice VC Studio")
-        self.root.geometry("1180x820")
-        self.root.minsize(1040, 720)
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+class VCStudioApp(QtWidgets.QMainWindow):
+    def __init__(self, args: argparse.Namespace, qt_app: QtWidgets.QApplication):
+        super().__init__()
+        self.qt_app = qt_app
+        self.colors = PALETTE.copy()
+        self.setWindowTitle("CosyVoice VC Studio")
+        self.resize(1240, 860)
+        self.setMinimumSize(1040, 720)
+        self.setObjectName("MainWindow")
 
         self.ui_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.worker_thread: threading.Thread | None = None
@@ -225,362 +370,951 @@ class VCStudioApp:
         self.backend = VCStudioBackend()
         self.input_device_map: dict[str, int | None] = {"Default": None}
         self.output_device_map: dict[str, int | None] = {"Default": None}
+        self._shutdown_done = False
 
         self._create_variables(args)
         self._configure_style()
         self._build_ui()
         self._refresh_audio_devices()
-        self.root.after(100, self._poll_ui_queue)
+
+        self.poll_timer = QtCore.QTimer(self)
+        self.poll_timer.timeout.connect(self._poll_ui_queue)
+        self.poll_timer.start(100)
 
     def mainloop(self) -> None:
-        self.root.mainloop()
+        self.show()
+        self.qt_app.exec()
 
     def _create_variables(self, args: argparse.Namespace) -> None:
-        tk = self.tk
-        self.model_dir_var = tk.StringVar(value=args.model_dir)
-        self.prompt_var = tk.StringVar(value=args.prompt)
-        self.source_var = tk.StringVar(value=args.source)
-        self.output_var = tk.StringVar(value=args.output)
-        self.csv_var = tk.StringVar(value=args.csv)
-        self.device_var = tk.StringVar(value=args.device)
-        self.ort_provider_var = tk.StringVar(value=args.ort_provider)
-        self.coreml_cache_var = tk.StringVar(value=args.coreml_cache_dir)
-        self.chunk_sec_var = tk.StringVar(value=f"{args.chunk_sec:g}")
-        self.tokenizer_chunk_sec_var = tk.StringVar(value=f"{args.tokenizer_chunk_sec:g}")
-        self.tokenizer_left_context_sec_var = tk.StringVar(value=f"{args.tokenizer_left_context_sec:g}")
-        self.tokenizer_right_context_sec_var = tk.StringVar(value=f"{args.tokenizer_right_context_sec:g}")
-        self.history_sec_var = tk.StringVar(value=f"{args.history_sec:g}")
-        self.mel_overlap_sec_var = tk.StringVar(value=f"{args.mel_overlap_sec:g}")
-        self.delayed_commit_sec_var = tk.StringVar(value=f"{args.delayed_commit_sec:g}")
-        self.audio_declick_ms_var = tk.StringVar(value=f"{args.audio_declick_ms:g}")
-        self.audio_blend_ms_var = tk.StringVar(value=f"{args.audio_blend_ms:g}")
-        self.vad_enabled_var = tk.BooleanVar(value=args.enable_vad)
-        self.vad_threshold_var = tk.StringVar(value=f"{args.vad_threshold:g}")
-        self.vad_min_speech_ms_var = tk.StringVar(value=f"{args.vad_min_speech_ms:g}")
-        self.vad_min_silence_ms_var = tk.StringVar(value=f"{args.vad_min_silence_ms:g}")
-        self.vad_speech_pad_ms_var = tk.StringVar(value=f"{args.vad_speech_pad_ms:g}")
-        self.flow_context_var = tk.StringVar(value=args.flow_context)
-        self.hift_mode_var = tk.StringVar(value=args.hift_mode)
-        self.prompt_cache_var = tk.BooleanVar(value=not args.disable_prompt_kv_cache)
-        self.history_cache_var = tk.BooleanVar(value=not args.disable_history_kv_cache)
-        self.input_device_var = tk.StringVar(value="Default")
-        self.output_device_var = tk.StringVar(value="Default")
-        self.status_var = tk.StringVar(value="Ready")
-        self.metric_chunk_var = tk.StringVar(value="-")
-        self.metric_rtf_var = tk.StringVar(value="-")
-        self.metric_lag_var = tk.StringVar(value="-")
-        self.metric_buffer_var = tk.StringVar(value="-")
-        self.metric_underflow_var = tk.StringVar(value="-")
+        self.model_dir_var = TextValue(args.model_dir)
+        self.prompt_var = TextValue(args.prompt)
+        self.source_var = TextValue(args.source)
+        self.output_var = TextValue(args.output)
+        self.csv_var = TextValue(args.csv)
+        self.device_var = TextValue(args.device)
+        self.ort_provider_var = TextValue(args.ort_provider)
+        self.coreml_cache_var = TextValue(args.coreml_cache_dir)
+        self.chunk_sec_var = TextValue(f"{args.chunk_sec:g}")
+        self.tokenizer_chunk_sec_var = TextValue(f"{args.tokenizer_chunk_sec:g}")
+        self.tokenizer_left_context_sec_var = TextValue(f"{args.tokenizer_left_context_sec:g}")
+        self.tokenizer_right_context_sec_var = TextValue(f"{args.tokenizer_right_context_sec:g}")
+        self.history_sec_var = TextValue(f"{args.history_sec:g}")
+        self.mel_overlap_sec_var = TextValue(f"{args.mel_overlap_sec:g}")
+        self.delayed_commit_sec_var = TextValue(f"{args.delayed_commit_sec:g}")
+        self.audio_declick_ms_var = TextValue(f"{args.audio_declick_ms:g}")
+        self.audio_blend_ms_var = TextValue(f"{args.audio_blend_ms:g}")
+        self.vad_enabled_var = BoolValue(args.enable_vad)
+        self.vad_threshold_var = TextValue(f"{args.vad_threshold:g}")
+        self.vad_min_speech_ms_var = TextValue(f"{args.vad_min_speech_ms:g}")
+        self.vad_min_silence_ms_var = TextValue(f"{args.vad_min_silence_ms:g}")
+        self.vad_speech_pad_ms_var = TextValue(f"{args.vad_speech_pad_ms:g}")
+        self.flow_context_var = TextValue(args.flow_context)
+        self.hift_mode_var = TextValue(args.hift_mode)
+        self.prompt_cache_var = BoolValue(not args.disable_prompt_kv_cache)
+        self.history_cache_var = BoolValue(not args.disable_history_kv_cache)
+        self.input_device_var = TextValue("Default")
+        self.output_device_var = TextValue("Default")
+        self.status_var = TextValue("Ready")
+        self.metric_chunk_var = TextValue("-")
+        self.metric_rtf_var = TextValue("-")
+        self.metric_lag_var = TextValue("-")
+        self.metric_buffer_var = TextValue("-")
+        self.metric_underflow_var = TextValue("-")
 
     def _configure_style(self) -> None:
-        style = self.ttk.Style()
-        try:
-            style.theme_use("clam")
-        except self.tk.TclError:
-            pass
-        bg = "#f4f1ea"
-        panel = "#fbf7ef"
-        card = "#ffffff"
-        text = "#252a31"
-        muted = "#747b72"
-        accent = "#2f7d75"
-        accent_hover = "#398f86"
-        danger = "#b85852"
-        danger_hover = "#c8645e"
-        line = "#ded6c9"
-        field = "#fffdf8"
-        tab = "#ebe4d7"
-        self.root.configure(bg=bg)
-        style.configure(".", background=bg, foreground=text, fieldbackground=field, bordercolor=line)
-        style.configure("TFrame", background=bg)
-        style.configure("Panel.TFrame", background=panel)
-        style.configure("Card.TFrame", background=card)
-        style.configure("TLabel", background=bg, foreground=text)
-        style.configure("Muted.TLabel", background=bg, foreground=muted)
-        style.configure("Panel.TLabel", background=panel, foreground=text)
-        style.configure("Card.TLabel", background=card, foreground=text)
-        style.configure("Title.TLabel", background=bg, foreground=text, font=("Helvetica", 22, "bold"))
-        style.configure("Subtitle.TLabel", background=bg, foreground=muted, font=("Helvetica", 12))
-        style.configure("Metric.TLabel", background=card, foreground=text, font=("Helvetica", 18, "bold"))
-        style.configure("MetricName.TLabel", background=card, foreground=muted, font=("Helvetica", 10))
-        style.configure("TButton", padding=(12, 7), background="#e8dfd0", foreground=text, bordercolor=line)
-        style.map("TButton", background=[("active", "#efe7da"), ("disabled", "#ded8ce")])
-        style.configure("Accent.TButton", background=accent, foreground="#ffffff", bordercolor=accent)
-        style.map("Accent.TButton", background=[("active", accent_hover), ("disabled", "#b9c7c2")])
-        style.configure("Danger.TButton", background=danger, foreground="#ffffff", bordercolor=danger)
-        style.map("Danger.TButton", background=[("active", danger_hover), ("disabled", "#d8c0bb")])
-        style.configure("TEntry", padding=5)
-        style.configure("TCombobox", padding=5)
-        style.configure("TNotebook", background=bg, borderwidth=0)
-        style.configure("TNotebook.Tab", padding=(18, 9), background=tab, foreground=muted)
-        style.map("TNotebook.Tab", background=[("selected", card)], foreground=[("selected", text)])
-        self.colors = {
-            "bg": bg,
-            "panel": panel,
-            "card": card,
-            "text": text,
-            "muted": muted,
-            "accent": accent,
-            "accent_hover": accent_hover,
-            "danger": danger,
-            "danger_hover": danger_hover,
-            "line": line,
-            "field": field,
-            "disabled": "#cfc7bb",
-        }
+        self.qt_app.setFont(QtGui.QFont("Arial", 10))
+        self.qt_app.setStyleSheet(
+            f"""
+            * {{
+                color: {self.colors["text"]};
+                font-family: "Avenir Next", "Helvetica Neue", Arial;
+                font-size: 13px;
+                letter-spacing: 0px;
+            }}
+            QMainWindow#MainWindow {{
+                background: {self.colors["bg"]};
+            }}
+            QLabel#Title {{
+                font-size: 28px;
+                font-weight: 800;
+                color: {self.colors["text"]};
+            }}
+            QLabel#Subtitle, QLabel#Muted {{
+                color: {self.colors["muted"]};
+            }}
+            QLabel#SectionTitle {{
+                font-size: 16px;
+                font-weight: 800;
+            }}
+            QLabel#SmallTitle {{
+                font-size: 14px;
+                font-weight: 800;
+            }}
+            QLabel#ParamHelp {{
+                color: {self.colors["muted"]};
+                font-size: 11px;
+                font-weight: 500;
+            }}
+            QToolButton#DisclosureButton {{
+                background-color: {self.colors["surface_alt"]};
+                border: 1px solid {self.colors["sky_soft"]};
+                border-radius: 13px;
+                padding: 9px 12px;
+                color: {self.colors["text"]};
+                font-weight: 800;
+                text-align: left;
+            }}
+            QToolButton#DisclosureButton:hover {{
+                background-color: {self.colors["purple"]};
+            }}
+            QFrame#AdvancedBody {{
+                background-color: rgba(255, 247, 250, 160);
+                border: 1px solid {self.colors["line"]};
+                border-radius: 16px;
+            }}
+            QLabel#StatusText {{
+                font-weight: 800;
+                color: {self.colors["text"]};
+            }}
+            QFrame#HeroPanel {{
+                background-color: rgba(255, 247, 250, 214);
+                border: 1px solid {self.colors["pink"]};
+                border-radius: 26px;
+            }}
+            QFrame#SidePanel, QFrame#LogPanel {{
+                background-color: rgba(255, 247, 250, 232);
+                border: 1px solid {self.colors["line"]};
+                border-radius: 24px;
+            }}
+            QFrame#Card {{
+                background-color: rgba(255, 252, 245, 238);
+                border: 1px solid {self.colors["line"]};
+                border-radius: 20px;
+            }}
+            QFrame#MetricCard {{
+                background-color: rgba(255, 252, 245, 245);
+                border: 1px solid {self.colors["line"]};
+                border-radius: 18px;
+            }}
+            QLabel#MetricName {{
+                color: {self.colors["muted"]};
+                font-size: 11px;
+                font-weight: 650;
+            }}
+            QLabel#MetricValue {{
+                color: {self.colors["text"]};
+                font-size: 19px;
+                font-weight: 850;
+            }}
+            QFrame#StatusPill {{
+                background-color: {self.colors["mint"]};
+                border: 1px solid {self.colors["mint_strong"]};
+                border-radius: 17px;
+            }}
+            QFrame#AccentStrip {{
+                background-color: {self.colors["pink"]};
+                border-radius: 4px;
+            }}
+            QLineEdit, QComboBox {{
+                background-color: {self.colors["field"]};
+                border: 1px solid {self.colors["line"]};
+                border-radius: 13px;
+                padding: 7px 11px;
+                min-height: 20px;
+                selection-background-color: {self.colors["pink"]};
+            }}
+            QLineEdit:focus, QComboBox:focus {{
+                border: 1px solid {self.colors["sky"]};
+                background-color: {self.colors["surface_alt"]};
+            }}
+            QComboBox::drop-down {{
+                border: none;
+                width: 26px;
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: {self.colors["field"]};
+                border: 1px solid {self.colors["line"]};
+                border-radius: 10px;
+                padding: 6px;
+                selection-background-color: {self.colors["pink"]};
+                outline: none;
+            }}
+            QPushButton#GhostButton {{
+                background-color: {self.colors["surface_alt"]};
+                border: 1px solid {self.colors["sky_soft"]};
+                border-radius: 13px;
+                padding: 8px 14px;
+                font-weight: 700;
+            }}
+            QPushButton#GhostButton:hover {{
+                background-color: {self.colors["sky"]};
+            }}
+            QPushButton#GhostButton:pressed {{
+                background-color: {self.colors["sky_soft"]};
+            }}
+            QPushButton#GhostButton:disabled {{
+                background-color: {self.colors["disabled"]};
+                color: #F8F4F8;
+            }}
+            QTabWidget::pane {{
+                border: 1px solid {self.colors["line"]};
+                border-radius: 22px;
+                background-color: rgba(255, 247, 250, 224);
+                top: -1px;
+            }}
+            QTabBar::tab {{
+                background-color: {self.colors["surface_alt"]};
+                border: 1px solid {self.colors["line"]};
+                border-bottom: none;
+                border-top-left-radius: 15px;
+                border-top-right-radius: 15px;
+                padding: 10px 20px;
+                margin-right: 6px;
+                color: {self.colors["muted"]};
+                font-weight: 750;
+            }}
+            QTabBar::tab:selected {{
+                background-color: {self.colors["pink"]};
+                color: {self.colors["text"]};
+            }}
+            QTabBar::tab:hover:!selected {{
+                background-color: {self.colors["purple"]};
+            }}
+            QScrollArea {{
+                background: transparent;
+                border: none;
+            }}
+            QScrollArea#TabScroll {{
+                background: transparent;
+                border: none;
+            }}
+            QWidget#TabViewport {{
+                background: {self.colors["surface_alt"]};
+            }}
+            QTextEdit {{
+                background-color: {self.colors["field"]};
+                border: 1px solid {self.colors["line"]};
+                border-radius: 18px;
+                padding: 10px;
+                selection-background-color: {self.colors["pink"]};
+                font-family: "Menlo", "Consolas";
+                font-size: 12px;
+            }}
+            QCheckBox {{
+                spacing: 10px;
+                font-weight: 650;
+                color: {self.colors["muted"]};
+            }}
+            QCheckBox:checked {{
+                color: {self.colors["text"]};
+            }}
+            QCheckBox::indicator {{
+                width: 18px;
+                height: 18px;
+                border-radius: 9px;
+                border: 1px solid {self.colors["line"]};
+                background-color: {self.colors["field"]};
+            }}
+            QCheckBox::indicator:checked {{
+                background-color: {self.colors["mint"]};
+                border: 1px solid {self.colors["mint_strong"]};
+            }}
+            QSplitter::handle {{
+                background: transparent;
+            }}
+            QScrollBar:vertical {{
+                background: transparent;
+                width: 12px;
+                margin: 8px 2px 8px 2px;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {self.colors["purple"]};
+                border-radius: 5px;
+                min-height: 28px;
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                height: 0px;
+            }}
+            """
+        )
 
     def _build_ui(self) -> None:
-        ttk = self.ttk
-        root = self.root
-        root.columnconfigure(0, weight=1)
-        root.rowconfigure(1, weight=1)
+        root = KawaiiBackdrop(self.colors)
+        self.setCentralWidget(root)
+        layout = QtWidgets.QVBoxLayout(root)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(14)
 
-        header = ttk.Frame(root, padding=(18, 16, 18, 8))
-        header.grid(row=0, column=0, sticky="ew")
-        header.columnconfigure(0, weight=1)
-        ttk.Label(header, text="CosyVoice VC Studio", style="Title.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(
-            header,
-            text="Realtime microphone conversion and offline benchmark in one control room.",
-            style="Subtitle.TLabel",
-        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
-        ttk.Label(header, textvariable=self.status_var, style="Subtitle.TLabel").grid(row=0, column=1, rowspan=2, sticky="e")
+        layout.addWidget(self._build_header())
 
-        body = ttk.Frame(root, padding=(18, 6, 18, 10))
-        body.grid(row=1, column=0, sticky="nsew")
-        body.columnconfigure(0, weight=0)
-        body.columnconfigure(1, weight=1)
-        body.rowconfigure(0, weight=1)
+        body = QtWidgets.QHBoxLayout()
+        body.setSpacing(14)
+        self.model_panel = QtWidgets.QFrame()
+        self.model_panel.setObjectName("SidePanel")
+        self.model_panel.setFixedWidth(390)
+        self._build_model_panel(self.model_panel)
+        body.addWidget(self.model_panel)
 
-        left = ttk.Frame(body, style="Panel.TFrame", padding=14)
-        left.grid(row=0, column=0, sticky="nsw", padx=(0, 14))
-        left.columnconfigure(1, weight=1)
-        self._build_model_panel(left)
+        self.notebook = QtWidgets.QTabWidget()
+        self.notebook.setDocumentMode(True)
+        self._build_realtime_tab(self.notebook)
+        self._build_offline_tab(self.notebook)
+        self._build_parameters_tab(self.notebook)
+        body.addWidget(self.notebook, 1)
+        layout.addLayout(body, 1)
 
-        right = ttk.Frame(body)
-        right.grid(row=0, column=1, sticky="nsew")
-        right.columnconfigure(0, weight=1)
-        right.rowconfigure(0, weight=1)
-        notebook = ttk.Notebook(right)
-        notebook.grid(row=0, column=0, sticky="nsew")
-        self._build_realtime_tab(notebook)
-        self._build_offline_tab(notebook)
-        self._build_parameters_tab(notebook)
+        layout.addWidget(self._build_log_panel())
 
-        bottom = ttk.Frame(root, padding=(18, 0, 18, 16))
-        bottom.grid(row=2, column=0, sticky="nsew")
-        bottom.columnconfigure(0, weight=1)
-        bottom.rowconfigure(1, weight=1)
-        ttk.Label(bottom, text="Run Log", style="Subtitle.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 6))
-        self.log_text = self.tk.Text(
-            bottom,
-            height=9,
-            bg=self.colors["field"],
-            fg=self.colors["text"],
-            insertbackground=self.colors["text"],
-            relief="flat",
-            highlightthickness=1,
-            highlightbackground=self.colors["line"],
-            highlightcolor=self.colors["accent"],
-            padx=12,
-            pady=10,
-            wrap="word",
-        )
-        self.log_text.grid(row=1, column=0, sticky="nsew")
+    def _build_header(self) -> QtWidgets.QWidget:
+        header = QtWidgets.QFrame()
+        header.setObjectName("HeroPanel")
+        shadow = QtWidgets.QGraphicsDropShadowEffect(header)
+        shadow.setBlurRadius(20)
+        shadow.setOffset(0, 8)
+        shadow.setColor(QtGui.QColor(224, 177, 203, 65))
+        header.setGraphicsEffect(shadow)
 
-    def _build_model_panel(self, parent) -> None:
-        ttk = self.ttk
+        layout = QtWidgets.QHBoxLayout(header)
+        layout.setContentsMargins(22, 18, 22, 18)
+        layout.setSpacing(16)
+
+        accent = QtWidgets.QFrame()
+        accent.setObjectName("AccentStrip")
+        accent.setFixedSize(8, 54)
+        layout.addWidget(accent)
+
+        title_block = QtWidgets.QVBoxLayout()
+        title_block.setSpacing(4)
+        title = QtWidgets.QLabel("CosyVoice VC Studio")
+        title.setObjectName("Title")
+        subtitle = QtWidgets.QLabel("Realtime voice conversion and offline benchmark in one soft control room.")
+        subtitle.setObjectName("Subtitle")
+        title_block.addWidget(title)
+        title_block.addWidget(subtitle)
+        layout.addLayout(title_block, 1)
+
+        status_pill = QtWidgets.QFrame()
+        status_pill.setObjectName("StatusPill")
+        status_layout = QtWidgets.QHBoxLayout(status_pill)
+        status_layout.setContentsMargins(16, 7, 16, 7)
+        status_layout.setSpacing(8)
+        dot = QtWidgets.QLabel()
+        dot.setFixedSize(10, 10)
+        dot.setStyleSheet(f"background-color: {self.colors['mint_strong']}; border-radius: 5px;")
+        status_text = QtWidgets.QLabel(self.status_var.get())
+        status_text.setObjectName("StatusText")
+        self.status_var.changed.connect(status_text.setText)
+        status_layout.addWidget(dot)
+        status_layout.addWidget(status_text)
+        layout.addWidget(status_pill, 0, QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+        return header
+
+    def _build_log_panel(self) -> QtWidgets.QWidget:
+        panel = QtWidgets.QFrame()
+        panel.setObjectName("LogPanel")
+        layout = QtWidgets.QVBoxLayout(panel)
+        layout.setContentsMargins(16, 14, 16, 16)
+        layout.setSpacing(9)
+        title_row = QtWidgets.QHBoxLayout()
+        title_row.addWidget(self._section_title("Run Log", self.colors["sky"]))
+        title_row.addStretch(1)
+        layout.addLayout(title_row)
+        self.log_text = QtWidgets.QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMinimumHeight(128)
+        layout.addWidget(self.log_text)
+        return panel
+
+    def _build_model_panel(self, parent: QtWidgets.QWidget) -> None:
+        layout = QtWidgets.QVBoxLayout(parent)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(14)
+        layout.addWidget(self._section_title("Model", self.colors["pink"]))
+
+        form = QtWidgets.QGridLayout()
+        form.setHorizontalSpacing(8)
+        form.setVerticalSpacing(10)
+        form.setColumnStretch(1, 1)
         row = 0
-        ttk.Label(parent, text="Model", style="Panel.TLabel", font=("Helvetica", 14, "bold")).grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 12))
-        row += 1
-        row = self._path_row(parent, row, "Model dir", self.model_dir_var, "directory")
-        row = self._path_row(parent, row, "Prompt wav", self.prompt_var, "open_wav")
-        ttk.Label(parent, text="Torch device", style="Panel.TLabel").grid(row=row, column=0, sticky="w", pady=5)
-        ttk.Combobox(parent, textvariable=self.device_var, values=["auto", "cpu", "cuda", "mps"], state="readonly", width=12).grid(row=row, column=1, sticky="ew", pady=5)
-        row += 1
-        ttk.Label(parent, text="ORT provider", style="Panel.TLabel").grid(row=row, column=0, sticky="w", pady=5)
-        ttk.Combobox(parent, textvariable=self.ort_provider_var, values=["auto", "cpu", "cuda", "coreml"], state="readonly", width=12).grid(row=row, column=1, sticky="ew", pady=5)
-        row += 1
-        row = self._path_row(parent, row, "CoreML cache", self.coreml_cache_var, "directory", optional=True)
-        ttk.Separator(parent).grid(row=row, column=0, columnspan=3, sticky="ew", pady=14)
-        row += 1
-        ttk.Label(parent, text="Metrics", style="Panel.TLabel", font=("Helvetica", 14, "bold")).grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 8))
-        row += 1
-        metrics = ttk.Frame(parent, style="Panel.TFrame")
-        metrics.grid(row=row, column=0, columnspan=3, sticky="ew")
-        metrics.columnconfigure((0, 1), weight=1)
-        self._metric_card(metrics, 0, 0, "Chunk", self.metric_chunk_var)
-        self._metric_card(metrics, 0, 1, "RTF", self.metric_rtf_var)
-        self._metric_card(metrics, 1, 0, "Lag", self.metric_lag_var)
-        self._metric_card(metrics, 1, 1, "Buffer", self.metric_buffer_var)
-        self._metric_card(metrics, 2, 0, "Underflows", self.metric_underflow_var)
+        row = self._path_row(form, row, "Model dir", self.model_dir_var, "directory")
+        row = self._path_row(form, row, "Prompt wav", self.prompt_var, "open_wav")
+        row = self._combo_row(form, row, "Torch device", self.device_var, ["auto", "cpu", "cuda", "mps"])
+        row = self._combo_row(form, row, "ORT provider", self.ort_provider_var, ["auto", "cpu", "cuda", "coreml"])
+        self._path_row(form, row, "CoreML cache", self.coreml_cache_var, "directory")
+        layout.addLayout(form)
 
-    def _build_realtime_tab(self, notebook) -> None:
-        ttk = self.ttk
-        tab = ttk.Frame(notebook, padding=18)
-        tab.columnconfigure(0, weight=1)
-        notebook.add(tab, text="Realtime")
-        ttk.Label(tab, text="Audio I/O", font=("Helvetica", 15, "bold")).grid(row=0, column=0, sticky="w")
-        device_frame = ttk.Frame(tab)
-        device_frame.grid(row=1, column=0, sticky="ew", pady=(12, 16))
-        device_frame.columnconfigure(1, weight=1)
-        ttk.Label(device_frame, text="Input").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=5)
-        self.input_device_combo = ttk.Combobox(device_frame, textvariable=self.input_device_var, state="readonly")
-        self.input_device_combo.grid(row=0, column=1, sticky="ew", pady=5)
-        ttk.Label(device_frame, text="Output").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=5)
-        self.output_device_combo = ttk.Combobox(device_frame, textvariable=self.output_device_var, state="readonly")
-        self.output_device_combo.grid(row=1, column=1, sticky="ew", pady=5)
-        ttk.Button(device_frame, text="Refresh", command=self._refresh_audio_devices).grid(row=0, column=2, rowspan=2, sticky="ns", padx=(10, 0), pady=5)
+        divider = QtWidgets.QFrame()
+        divider.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+        divider.setStyleSheet(f"color: {self.colors['line']};")
+        layout.addWidget(divider)
 
-        buttons = ttk.Frame(tab)
-        buttons.grid(row=2, column=0, sticky="w", pady=(4, 20))
-        self.start_live_button = RoundedButton(
-            buttons,
+        layout.addWidget(self._section_title("Metrics", self.colors["mint"]))
+        metrics = QtWidgets.QGridLayout()
+        metrics.setSpacing(10)
+        metrics.setColumnStretch(0, 1)
+        metrics.setColumnStretch(1, 1)
+        self._metric_card(metrics, 0, 0, "Chunk", self.metric_chunk_var, self.colors["pink"])
+        self._metric_card(metrics, 0, 1, "RTF", self.metric_rtf_var, self.colors["sky"])
+        self._metric_card(metrics, 1, 0, "Lag", self.metric_lag_var, self.colors["cream"])
+        self._metric_card(metrics, 1, 1, "Buffer", self.metric_buffer_var, self.colors["mint"])
+        self._metric_card(metrics, 2, 0, "Underflows", self.metric_underflow_var, self.colors["purple"], 2)
+        layout.addLayout(metrics)
+        layout.addStretch(1)
+
+    def _build_realtime_tab(self, notebook: QtWidgets.QTabWidget) -> None:
+        content = QtWidgets.QWidget()
+        self._fill_widget(content, self.colors["surface_alt"])
+        layout = QtWidgets.QVBoxLayout(content)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(14)
+
+        audio_card = self._card()
+        audio_layout = QtWidgets.QGridLayout(audio_card)
+        audio_layout.setContentsMargins(18, 18, 18, 18)
+        audio_layout.setHorizontalSpacing(10)
+        audio_layout.setVerticalSpacing(12)
+        audio_layout.setColumnStretch(1, 1)
+        audio_layout.addWidget(self._section_title("Audio I/O", self.colors["sky"]), 0, 0, 1, 3)
+        audio_layout.addWidget(self._field_label("Input"), 1, 0)
+        self.input_device_combo = QtWidgets.QComboBox()
+        self._bind_combo(self.input_device_combo, self.input_device_var, ["Default"])
+        audio_layout.addWidget(self.input_device_combo, 1, 1)
+        audio_layout.addWidget(self._field_label("Output"), 2, 0)
+        self.output_device_combo = QtWidgets.QComboBox()
+        self._bind_combo(self.output_device_combo, self.output_device_var, ["Default"])
+        audio_layout.addWidget(self.output_device_combo, 2, 1)
+        refresh_button = self._ghost_button("Refresh", self._refresh_audio_devices)
+        audio_layout.addWidget(refresh_button, 1, 2, 2, 1)
+        layout.addWidget(audio_card)
+
+        control_card = self._card()
+        control_layout = QtWidgets.QVBoxLayout(control_card)
+        control_layout.setContentsMargins(18, 18, 18, 18)
+        control_layout.setSpacing(14)
+        control_layout.addWidget(self._section_title("Live Control", self.colors["pink"]))
+        buttons = QtWidgets.QHBoxLayout()
+        buttons.setSpacing(10)
+        self.start_live_button = CuteButton(
             "Start Live",
             self._start_realtime,
-            width=132,
-            fill=self.colors["accent"],
-            hover_fill=self.colors["accent_hover"],
-            disabled_fill=self.colors["disabled"],
-            foreground="#ffffff",
-            background=self.colors["bg"],
+            base=self.colors["mint"],
+            hover=self.colors["mint_strong"],
+            disabled=self.colors["disabled"],
+            min_width=132,
         )
-        self.start_live_button.grid(row=0, column=0, padx=(0, 8))
-        self.stop_live_button = RoundedButton(
-            buttons,
+        self.stop_live_button = CuteButton(
             "Stop",
             self._stop_realtime,
-            width=92,
-            fill=self.colors["danger"],
-            hover_fill=self.colors["danger_hover"],
-            disabled_fill=self.colors["disabled"],
-            foreground="#ffffff",
-            background=self.colors["bg"],
+            base=self.colors["danger"],
+            hover=self.colors["danger_hover"],
+            disabled=self.colors["disabled"],
+            foreground="#FFF8F8",
+            min_width=92,
         )
         self.stop_live_button.configure(state="disabled")
-        self.stop_live_button.grid(row=0, column=1)
-
-        hint = (
-            "Use headphones to avoid feeding generated audio back into the microphone. "
-            "Lower chunk and overlap values reduce latency; larger context usually improves stability."
+        buttons.addWidget(self.start_live_button)
+        buttons.addWidget(self.stop_live_button)
+        buttons.addStretch(1)
+        control_layout.addLayout(buttons)
+        hint = QtWidgets.QLabel(
+            "Use headphones to avoid feedback. Smaller chunks reduce latency; more context can improve stability."
         )
-        ttk.Label(tab, text=hint, style="Muted.TLabel", wraplength=680).grid(row=3, column=0, sticky="w")
+        hint.setObjectName("Muted")
+        hint.setWordWrap(True)
+        control_layout.addWidget(hint)
+        layout.addWidget(control_card)
+        layout.addStretch(1)
 
-    def _build_offline_tab(self, notebook) -> None:
-        ttk = self.ttk
-        tab = ttk.Frame(notebook, padding=18)
-        tab.columnconfigure(1, weight=1)
-        notebook.add(tab, text="Offline Benchmark")
-        ttk.Label(tab, text="Benchmark Job", font=("Helvetica", 15, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 12))
+        notebook.addTab(self._scroll(content), "Realtime")
+
+    def _build_offline_tab(self, notebook: QtWidgets.QTabWidget) -> None:
+        content = QtWidgets.QWidget()
+        self._fill_widget(content, self.colors["surface_alt"])
+        layout = QtWidgets.QVBoxLayout(content)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(14)
+
+        job_card = self._card()
+        grid = QtWidgets.QGridLayout(job_card)
+        grid.setContentsMargins(18, 18, 18, 18)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(10)
+        grid.setColumnStretch(1, 1)
+        grid.addWidget(self._section_title("Benchmark Job", self.colors["purple"]), 0, 0, 1, 3)
         row = 1
-        row = self._path_row(tab, row, "Source wav", self.source_var, "open_wav")
-        row = self._path_row(tab, row, "Output wav", self.output_var, "save_wav")
-        row = self._path_row(tab, row, "CSV report", self.csv_var, "save_csv", optional=True)
-        buttons = ttk.Frame(tab)
-        buttons.grid(row=row, column=0, columnspan=3, sticky="w", pady=(14, 0))
-        self.run_offline_button = RoundedButton(
-            buttons,
+        row = self._path_row(grid, row, "Source wav", self.source_var, "open_wav")
+        row = self._path_row(grid, row, "Output wav", self.output_var, "save_wav")
+        row = self._path_row(grid, row, "CSV report", self.csv_var, "save_csv")
+        layout.addWidget(job_card)
+
+        controls = self._card()
+        controls_layout = QtWidgets.QHBoxLayout(controls)
+        controls_layout.setContentsMargins(18, 18, 18, 18)
+        controls_layout.setSpacing(10)
+        self.run_offline_button = CuteButton(
             "Run Benchmark",
             self._start_offline,
-            width=158,
-            fill=self.colors["accent"],
-            hover_fill=self.colors["accent_hover"],
-            disabled_fill=self.colors["disabled"],
-            foreground="#ffffff",
-            background=self.colors["bg"],
+            base=self.colors["sky"],
+            hover=self.colors["sky_soft"],
+            disabled=self.colors["disabled"],
+            min_width=158,
         )
-        self.run_offline_button.grid(row=0, column=0, padx=(0, 8))
-        self.stop_offline_button = RoundedButton(
-            buttons,
+        self.stop_offline_button = CuteButton(
             "Stop",
             self._stop_offline,
-            width=92,
-            fill=self.colors["danger"],
-            hover_fill=self.colors["danger_hover"],
-            disabled_fill=self.colors["disabled"],
-            foreground="#ffffff",
-            background=self.colors["bg"],
+            base=self.colors["danger"],
+            hover=self.colors["danger_hover"],
+            disabled=self.colors["disabled"],
+            foreground="#FFF8F8",
+            min_width=92,
         )
         self.stop_offline_button.configure(state="disabled")
-        self.stop_offline_button.grid(row=0, column=1)
+        controls_layout.addWidget(self.run_offline_button)
+        controls_layout.addWidget(self.stop_offline_button)
+        controls_layout.addStretch(1)
+        layout.addWidget(controls)
+        layout.addStretch(1)
 
-    def _build_parameters_tab(self, notebook) -> None:
-        ttk = self.ttk
-        tab = ttk.Frame(notebook, padding=18)
-        tab.columnconfigure((0, 1), weight=1)
-        notebook.add(tab, text="Parameters")
+        notebook.addTab(self._scroll(content), "Offline Benchmark")
 
-        left = ttk.Frame(tab, style="Card.TFrame", padding=14)
-        right = ttk.Frame(tab, style="Card.TFrame", padding=14)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        right.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
-        ttk.Label(left, text="Timing", style="Card.TLabel", font=("Helvetica", 14, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
-        timing = [
-            ("Chunk sec", self.chunk_sec_var),
-            ("Tokenizer chunk", self.tokenizer_chunk_sec_var),
-            ("Tokenizer left ctx", self.tokenizer_left_context_sec_var),
-            ("Tokenizer right ctx", self.tokenizer_right_context_sec_var),
-            ("History sec", self.history_sec_var),
-            ("Mel overlap sec", self.mel_overlap_sec_var),
-            ("Delayed commit sec", self.delayed_commit_sec_var),
-        ]
-        for index, (label, var) in enumerate(timing, start=1):
-            self._number_row(left, index, label, var)
+    def _build_parameters_tab(self, notebook: QtWidgets.QTabWidget) -> None:
+        content = QtWidgets.QWidget()
+        self._fill_widget(content, self.colors["surface_alt"])
+        layout = QtWidgets.QHBoxLayout(content)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(14)
 
-        ttk.Label(right, text="Quality / Runtime", style="Card.TLabel", font=("Helvetica", 14, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
-        self._number_row(right, 1, "De-click ms", self.audio_declick_ms_var)
-        self._number_row(right, 2, "Audio blend ms", self.audio_blend_ms_var)
-        ttk.Checkbutton(right, text="Silero VAD gate", variable=self.vad_enabled_var).grid(row=3, column=0, columnspan=2, sticky="w", pady=(12, 2))
-        self._number_row(right, 4, "VAD threshold", self.vad_threshold_var)
-        self._number_row(right, 5, "VAD min speech ms", self.vad_min_speech_ms_var)
-        self._number_row(right, 6, "VAD min silence ms", self.vad_min_silence_ms_var)
-        self._number_row(right, 7, "VAD speech pad ms", self.vad_speech_pad_ms_var)
-        ttk.Label(right, text="Flow context", style="Card.TLabel").grid(row=8, column=0, sticky="w", pady=6)
-        ttk.Combobox(right, textvariable=self.flow_context_var, values=["streaming", "window-full"], state="readonly").grid(row=8, column=1, sticky="ew", pady=6)
-        ttk.Label(right, text="HiFT mode", style="Card.TLabel").grid(row=9, column=0, sticky="w", pady=6)
-        ttk.Combobox(right, textvariable=self.hift_mode_var, values=["stateful", "window"], state="readonly").grid(row=9, column=1, sticky="ew", pady=6)
-        ttk.Checkbutton(right, text="Prompt KV cache", variable=self.prompt_cache_var).grid(row=10, column=0, columnspan=2, sticky="w", pady=(12, 2))
-        ttk.Checkbutton(right, text="History KV cache", variable=self.history_cache_var).grid(row=11, column=0, columnspan=2, sticky="w", pady=2)
-        left.columnconfigure(1, weight=1)
-        right.columnconfigure(1, weight=1)
+        timing = self._card()
+        timing_layout = QtWidgets.QVBoxLayout(timing)
+        timing_layout.setContentsMargins(18, 18, 18, 18)
+        timing_layout.setSpacing(12)
+        timing_layout.addWidget(self._section_title("Timing", self.colors["cream"]))
+        timing_form = QtWidgets.QFormLayout()
+        timing_form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+        timing_form.setFormAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
+        timing_form.setHorizontalSpacing(16)
+        timing_form.setVerticalSpacing(14)
+        for label, var, description in [
+            (
+                "Chunk sec",
+                self.chunk_sec_var,
+                "Committed source duration per inference step. Higher values can improve continuity, "
+                "but add latency and more work per update; lower values feel faster but may sound less stable.",
+            ),
+            (
+                "Tokenizer chunk",
+                self.tokenizer_chunk_sec_var,
+                "Speech-tokenizer step size; 0 follows Chunk sec. Higher values reduce boundary churn "
+                "and overhead, but increase wait time; lower values update sooner with more edge risk.",
+            ),
+            (
+                "Tokenizer left ctx",
+                self.tokenizer_left_context_sec_var,
+                "Past audio supplied only to stabilize token boundaries. Raising it can smooth consonants "
+                "and phrase starts, but increases tokenizer compute.",
+            ),
+            (
+                "Tokenizer right ctx",
+                self.tokenizer_right_context_sec_var,
+                "Future audio lookahead for tokenizer decisions. Raising it often improves endings and "
+                "boundary quality, but directly increases latency.",
+            ),
+            (
+                "History sec",
+                self.history_sec_var,
+                "Past converted tokens prepended to each flow window. Higher values improve prosody and "
+                "speaker continuity, but raise attention/vocoder load.",
+            ),
+            (
+                "Mel overlap sec",
+                self.mel_overlap_sec_var,
+                "Extra mel context blended across neighboring chunks. Higher values smooth joins and can "
+                "improve quality, but add compute and may soften timing.",
+            ),
+            (
+                "Delayed commit sec",
+                self.delayed_commit_sec_var,
+                "Holds output until extra future context is available. Raising it can improve transitions "
+                "and prosody, but increases output latency.",
+            ),
+        ]:
+            self._number_row(timing_form, label, var, description)
+        timing_layout.addLayout(timing_form)
+        timing_layout.addStretch(1)
+        layout.addWidget(timing, 1)
 
-    def _number_row(self, parent, row: int, label: str, variable) -> None:
-        self.ttk.Label(parent, text=label, style="Card.TLabel").grid(row=row, column=0, sticky="w", pady=6)
-        self.ttk.Entry(parent, textvariable=variable, width=12).grid(row=row, column=1, sticky="ew", pady=6)
+        quality = self._card()
+        quality_layout = QtWidgets.QVBoxLayout(quality)
+        quality_layout.setContentsMargins(18, 16, 18, 16)
+        quality_layout.setSpacing(9)
+        quality_layout.addWidget(self._section_title("Quality / Runtime", self.colors["mint"]))
+        quality_form = QtWidgets.QFormLayout()
+        quality_form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+        quality_form.setFormAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
+        quality_form.setHorizontalSpacing(16)
+        quality_form.setVerticalSpacing(12)
+        self._number_row(
+            quality_form,
+            "De-click ms",
+            self.audio_declick_ms_var,
+            "Short fade at waveform boundaries. Raising it masks clicks, but can soften transients; "
+            "0 leaves boundaries untouched.",
+        )
+        self._number_row(
+            quality_form,
+            "Audio blend ms",
+            self.audio_blend_ms_var,
+            "Crossfades adjacent audio chunks. Raising it smooths joins, but can smear attacks and adds "
+            "a small post-processing cost.",
+        )
 
-    def _path_row(self, parent, row: int, label: str, variable, kind: str, optional: bool = False) -> int:
-        ttk = self.ttk
-        style = "Panel.TLabel" if str(parent.cget("style")) == "Panel.TFrame" else "TLabel"
-        ttk.Label(parent, text=label, style=style).grid(row=row, column=0, sticky="w", pady=5, padx=(0, 8))
-        ttk.Entry(parent, textvariable=variable, width=36).grid(row=row, column=1, sticky="ew", pady=5)
-        ttk.Button(parent, text="Browse", command=lambda: self._browse_path(variable, kind)).grid(row=row, column=2, sticky="ew", padx=(8, 0), pady=5)
-        if optional:
-            variable.set(variable.get())
+        self._checkbox_row(
+            quality_form,
+            "Silero VAD gate",
+            self.vad_enabled_var,
+            "Detects non-speech and fades matching output to silence. Enabling it reduces room noise "
+            "being converted into voice, but strict settings can mute quiet or short speech.",
+        )
+        self._number_row(
+            quality_form,
+            "VAD threshold",
+            self.vad_threshold_var,
+            "Speech probability cutoff. Raising it is stricter and suppresses more noise, but can miss "
+            "soft speech; lowering it catches quieter speech with more false positives.",
+        )
+        self._number_row(
+            quality_form,
+            "VAD min speech ms",
+            self.vad_min_speech_ms_var,
+            "Minimum speech duration accepted by VAD. Raising it ignores brief noises, but can drop short "
+            "words; lowering it reacts to shorter speech.",
+        )
+        self._number_row(
+            quality_form,
+            "VAD min silence ms",
+            self.vad_min_silence_ms_var,
+            "Silence duration required before closing a speech segment. Raising it avoids choppy gating, "
+            "but holds noise longer; lowering it cuts faster.",
+        )
+        self._number_row(
+            quality_form,
+            "VAD speech pad ms",
+            self.vad_speech_pad_ms_var,
+            "Extra padding around detected speech. Raising it preserves starts and endings, but passes "
+            "more room tone; lowering it gates tighter and may clip edges.",
+        )
+        quality_layout.addLayout(quality_form)
+
+        advanced_panel, advanced_form = self._advanced_panel()
+        self._combo_form_row(
+            advanced_form,
+            "Flow context",
+            self.flow_context_var,
+            ["streaming", "window-full"],
+            "Attention mode inside each flow window. window-full can improve local quality, but disables "
+            "streaming caches and costs more; streaming is faster.",
+        )
+        self._combo_form_row(
+            advanced_form,
+            "HiFT mode",
+            self.hift_mode_var,
+            ["stateful", "window"],
+            "Vocoder state strategy. stateful reuses caches for lower compute and real-time smoothness; "
+            "window recomputes bounded context and is safer for quality debugging.",
+        )
+        self._checkbox_row(
+            advanced_form,
+            "Prompt KV cache",
+            self.prompt_cache_var,
+            "Caches target-speaker prompt attention in streaming flow. Enabling it reduces repeated compute "
+            "and latency; disabling can help diagnose cache-related artifacts.",
+        )
+        self._checkbox_row(
+            advanced_form,
+            "History KV cache",
+            self.history_cache_var,
+            "Caches reusable history attention when alignment allows. Enabling it lowers compute for longer "
+            "context; disabling is slower but simpler.",
+        )
+        quality_layout.addWidget(advanced_panel)
+        quality_layout.addStretch(1)
+        layout.addWidget(quality, 1)
+
+        notebook.addTab(self._scroll(content), "Parameters")
+
+    def _card(self) -> QtWidgets.QFrame:
+        card = QtWidgets.QFrame()
+        card.setObjectName("Card")
+        shadow = QtWidgets.QGraphicsDropShadowEffect(card)
+        shadow.setBlurRadius(12)
+        shadow.setOffset(0, 5)
+        shadow.setColor(QtGui.QColor(188, 174, 196, 42))
+        card.setGraphicsEffect(shadow)
+        return card
+
+    def _scroll(self, content: QtWidgets.QWidget) -> QtWidgets.QScrollArea:
+        scroll = QtWidgets.QScrollArea()
+        scroll.setObjectName("TabScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        scroll.viewport().setObjectName("TabViewport")
+        self._fill_widget(scroll.viewport(), self.colors["surface_alt"])
+        scroll.setWidget(content)
+        return scroll
+
+    def _fill_widget(self, widget: QtWidgets.QWidget, color: str) -> None:
+        palette = widget.palette()
+        palette.setColor(QtGui.QPalette.ColorRole.Window, QtGui.QColor(color))
+        widget.setPalette(palette)
+        widget.setAutoFillBackground(True)
+
+    def _advanced_panel(self) -> tuple[QtWidgets.QWidget, QtWidgets.QFormLayout]:
+        panel = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(panel)
+        layout.setContentsMargins(0, 2, 0, 0)
+        layout.setSpacing(8)
+
+        button = QtWidgets.QToolButton()
+        button.setObjectName("DisclosureButton")
+        button.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        button.setArrowType(QtCore.Qt.ArrowType.RightArrow)
+        button.setText("Advanced model/runtime controls")
+        button.setCheckable(True)
+        button.setChecked(False)
+        button.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        layout.addWidget(button)
+
+        body = QtWidgets.QFrame()
+        body.setObjectName("AdvancedBody")
+        body.setVisible(False)
+        body_layout = QtWidgets.QVBoxLayout(body)
+        body_layout.setContentsMargins(14, 14, 14, 14)
+        body_layout.setSpacing(8)
+        form = QtWidgets.QFormLayout()
+        form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+        form.setFormAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
+        form.setHorizontalSpacing(16)
+        form.setVerticalSpacing(12)
+        body_layout.addLayout(form)
+        layout.addWidget(body)
+
+        button.toggled.connect(lambda checked: self._set_disclosure_open(button, body, checked))
+        return panel, form
+
+    def _set_disclosure_open(
+        self,
+        button: QtWidgets.QToolButton,
+        body: QtWidgets.QWidget,
+        checked: bool,
+    ) -> None:
+        body.setVisible(checked)
+        button.setArrowType(QtCore.Qt.ArrowType.DownArrow if checked else QtCore.Qt.ArrowType.RightArrow)
+
+    def _section_title(self, text: str, color: str) -> QtWidgets.QWidget:
+        holder = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(holder)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(9)
+        dot = QtWidgets.QFrame()
+        dot.setFixedSize(12, 12)
+        dot.setStyleSheet(f"background-color: {color}; border-radius: 6px;")
+        label = QtWidgets.QLabel(text)
+        label.setObjectName("SectionTitle")
+        layout.addWidget(dot, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(label)
+        layout.addStretch(1)
+        return holder
+
+    def _field_label(self, text: str) -> QtWidgets.QLabel:
+        label = QtWidgets.QLabel(text)
+        label.setObjectName("SmallTitle")
+        return label
+
+    def _number_row(
+        self,
+        form: QtWidgets.QFormLayout,
+        label: str,
+        variable: TextValue,
+        description: str,
+    ) -> None:
+        field = QtWidgets.QLineEdit()
+        field.setMaximumWidth(190)
+        self._bind_line_edit(field, variable)
+        form.addRow(self._field_label(label), self._described_control(field, description))
+
+    def _path_row(
+        self,
+        grid: QtWidgets.QGridLayout,
+        row: int,
+        label: str,
+        variable: TextValue,
+        kind: str,
+    ) -> int:
+        field = QtWidgets.QLineEdit()
+        self._bind_line_edit(field, variable)
+        button = self._ghost_button("Browse", lambda: self._browse_path(variable, kind))
+        grid.addWidget(self._field_label(label), row, 0)
+        grid.addWidget(field, row, 1)
+        grid.addWidget(button, row, 2)
         return row + 1
 
-    def _metric_card(self, parent, row: int, column: int, name: str, variable) -> None:
-        card = MetricCard(parent, name, variable, colors=self.colors)
-        card.grid(row=row, column=column, sticky="ew", padx=4, pady=4)
+    def _combo_row(
+        self,
+        grid: QtWidgets.QGridLayout,
+        row: int,
+        label: str,
+        variable: TextValue,
+        values: list[str],
+    ) -> int:
+        combo = QtWidgets.QComboBox()
+        self._bind_combo(combo, variable, values)
+        grid.addWidget(self._field_label(label), row, 0)
+        grid.addWidget(combo, row, 1, 1, 2)
+        return row + 1
 
-    def _browse_path(self, variable, kind: str) -> None:
+    def _combo_form_row(
+        self,
+        form: QtWidgets.QFormLayout,
+        label: str,
+        variable: TextValue,
+        values: list[str],
+        description: str,
+    ) -> None:
+        combo = QtWidgets.QComboBox()
+        combo.setMaximumWidth(220)
+        self._bind_combo(combo, variable, values)
+        form.addRow(self._field_label(label), self._described_control(combo, description))
+
+    def _checkbox_row(
+        self,
+        form: QtWidgets.QFormLayout,
+        label: str,
+        variable: BoolValue,
+        description: str,
+    ) -> None:
+        checkbox = QtWidgets.QCheckBox()
+        self._bind_checkbox(checkbox, variable)
+        self._update_checkbox_text(checkbox, variable.get())
+        checkbox.toggled.connect(lambda checked, widget=checkbox: self._update_checkbox_text(widget, checked))
+        variable.changed.connect(lambda checked, widget=checkbox: self._update_checkbox_text(widget, checked))
+        form.addRow(self._field_label(label), self._described_control(checkbox, description))
+
+    def _update_checkbox_text(self, checkbox: QtWidgets.QCheckBox, checked: bool) -> None:
+        checkbox.setText("On" if checked else "Off")
+
+    def _described_control(self, control: QtWidgets.QWidget, description: str) -> QtWidgets.QWidget:
+        holder = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(holder)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        help_label = QtWidgets.QLabel(description)
+        help_label.setObjectName("ParamHelp")
+        help_label.setWordWrap(True)
+        help_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(control)
+        layout.addWidget(help_label)
+        return holder
+
+    def _metric_card(
+        self,
+        grid: QtWidgets.QGridLayout,
+        row: int,
+        column: int,
+        name: str,
+        variable: TextValue,
+        accent: str,
+        column_span: int = 1,
+    ) -> None:
+        card = MetricCard(name, variable, self.colors, accent)
+        grid.addWidget(card, row, column, 1, column_span)
+
+    def _ghost_button(self, text: str, command) -> QtWidgets.QPushButton:
+        button = QtWidgets.QPushButton(text)
+        button.setObjectName("GhostButton")
+        button.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        button.clicked.connect(command)
+        button.setMinimumHeight(38)
+        return button
+
+    def _bind_line_edit(self, field: QtWidgets.QLineEdit, variable: TextValue) -> None:
+        field.setText(variable.get())
+        field.textChanged.connect(variable.set)
+        variable.changed.connect(lambda value, widget=field: self._set_line_text(widget, value))
+
+    def _bind_combo(self, combo: QtWidgets.QComboBox, variable: TextValue, values: list[str]) -> None:
+        combo.addItems(values)
+        if variable.get() in values:
+            combo.setCurrentText(variable.get())
+        combo.currentTextChanged.connect(variable.set)
+        variable.changed.connect(lambda value, widget=combo: self._set_combo_text(widget, value))
+
+    def _bind_checkbox(self, checkbox: QtWidgets.QCheckBox, variable: BoolValue) -> None:
+        checkbox.setChecked(variable.get())
+        checkbox.toggled.connect(variable.set)
+        variable.changed.connect(lambda value, widget=checkbox: self._set_checkbox_value(widget, value))
+
+    def _set_line_text(self, field: QtWidgets.QLineEdit, value: str) -> None:
+        if field.text() == value:
+            return
+        blocker = QtCore.QSignalBlocker(field)
+        field.setText(value)
+        del blocker
+
+    def _set_combo_text(self, combo: QtWidgets.QComboBox, value: str) -> None:
+        if combo.currentText() == value:
+            return
+        index = combo.findText(value)
+        if index < 0:
+            return
+        blocker = QtCore.QSignalBlocker(combo)
+        combo.setCurrentIndex(index)
+        del blocker
+
+    def _set_checkbox_value(self, checkbox: QtWidgets.QCheckBox, value: bool) -> None:
+        if checkbox.isChecked() == value:
+            return
+        blocker = QtCore.QSignalBlocker(checkbox)
+        checkbox.setChecked(value)
+        del blocker
+
+    def _replace_combo_items(self, combo: QtWidgets.QComboBox, variable: TextValue, values: list[str]) -> None:
+        current = variable.get()
+        blocker = QtCore.QSignalBlocker(combo)
+        combo.clear()
+        combo.addItems(values)
+        if current in values:
+            combo.setCurrentText(current)
+        elif values:
+            combo.setCurrentText(values[0])
+        selected = combo.currentText()
+        del blocker
+        if selected != current:
+            variable.set(selected)
+
+    def _browse_path(self, variable: TextValue, kind: str) -> None:
+        initial = self._initial_dir(variable.get())
         if kind == "directory":
-            value = self.filedialog.askdirectory(initialdir=self._initial_dir(variable.get()))
+            value = QtWidgets.QFileDialog.getExistingDirectory(self, "Select directory", initial)
         elif kind == "save_wav":
-            value = self.filedialog.asksaveasfilename(
-                initialdir=self._initial_dir(variable.get()),
-                defaultextension=".wav",
-                filetypes=[("WAV audio", "*.wav"), ("All files", "*.*")],
+            value, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self,
+                "Save WAV",
+                variable.get() or str(Path(initial) / "vc_streaming.wav"),
+                "WAV audio (*.wav);;All files (*.*)",
             )
         elif kind == "save_csv":
-            value = self.filedialog.asksaveasfilename(
-                initialdir=self._initial_dir(variable.get()),
-                defaultextension=".csv",
-                filetypes=[("CSV", "*.csv"), ("All files", "*.*")],
+            value, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self,
+                "Save CSV",
+                variable.get() or str(Path(initial) / "vc_report.csv"),
+                "CSV (*.csv);;All files (*.*)",
             )
         else:
-            value = self.filedialog.askopenfilename(
-                initialdir=self._initial_dir(variable.get()),
-                filetypes=[("WAV audio", "*.wav"), ("All files", "*.*")],
+            value, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self,
+                "Open WAV",
+                initial,
+                "WAV audio (*.wav);;All files (*.*)",
             )
         if value:
             variable.set(value)
@@ -596,6 +1330,7 @@ class VCStudioApp:
     def _refresh_audio_devices(self) -> None:
         try:
             import sounddevice as sd
+
             devices = sd.query_devices()
             hostapis = sd.query_hostapis()
         except Exception as error:
@@ -612,21 +1347,19 @@ class VCStudioApp:
                     self.input_device_map[label] = index
                 if device.get("max_output_channels", 0) > 0:
                     self.output_device_map[label] = index
-        self.input_device_combo["values"] = list(self.input_device_map.keys())
-        self.output_device_combo["values"] = list(self.output_device_map.keys())
-        if self.input_device_var.get() not in self.input_device_map:
-            self.input_device_var.set("Default")
-        if self.output_device_var.get() not in self.output_device_map:
-            self.output_device_var.set("Default")
+        if hasattr(self, "input_device_combo"):
+            self._replace_combo_items(self.input_device_combo, self.input_device_var, list(self.input_device_map.keys()))
+        if hasattr(self, "output_device_combo"):
+            self._replace_combo_items(self.output_device_combo, self.output_device_var, list(self.output_device_map.keys()))
 
     def _start_offline(self) -> None:
         if self._is_running():
-            self.messagebox.showinfo("Busy", "A job is already running.")
+            QtWidgets.QMessageBox.information(self, "Busy", "A job is already running.")
             return
         try:
             config = self._snapshot_config(require_source=True)
         except ValueError as error:
-            self.messagebox.showerror("Invalid settings", str(error))
+            QtWidgets.QMessageBox.critical(self, "Invalid settings", str(error))
             return
         self.offline_stop_event = threading.Event()
         self._set_running("offline", True)
@@ -640,10 +1373,11 @@ class VCStudioApp:
 
     def _start_realtime(self) -> None:
         if self._is_running():
-            self.messagebox.showinfo("Busy", "A job is already running.")
+            QtWidgets.QMessageBox.information(self, "Busy", "A job is already running.")
             return
         if importlib.util.find_spec("sounddevice") is None:
-            self.messagebox.showerror(
+            QtWidgets.QMessageBox.critical(
+                self,
                 "Missing dependency",
                 "Realtime audio requires sounddevice. Install requirements.txt, then restart the GUI.",
             )
@@ -651,7 +1385,7 @@ class VCStudioApp:
         try:
             config = self._snapshot_config(require_source=False)
         except ValueError as error:
-            self.messagebox.showerror("Invalid settings", str(error))
+            QtWidgets.QMessageBox.critical(self, "Invalid settings", str(error))
             return
         config = replace(
             config,
@@ -741,25 +1475,25 @@ class VCStudioApp:
             disable_history_kv_cache=not self.history_cache_var.get(),
         )
 
-    def _positive_float(self, variable, name: str) -> float:
+    def _positive_float(self, variable: TextValue, name: str) -> float:
         value = self._float(variable, name)
         if value <= 0:
             raise ValueError(f"{name} must be greater than 0.")
         return value
 
-    def _nonnegative_float(self, variable, name: str) -> float:
+    def _nonnegative_float(self, variable: TextValue, name: str) -> float:
         value = self._float(variable, name)
         if value < 0:
             raise ValueError(f"{name} must be 0 or greater.")
         return value
 
-    def _float_in_range(self, variable, name: str, minimum: float, maximum: float) -> float:
+    def _float_in_range(self, variable: TextValue, name: str, minimum: float, maximum: float) -> float:
         value = self._float(variable, name)
         if value < minimum or value > maximum:
             raise ValueError(f"{name} must be between {minimum:g} and {maximum:g}.")
         return value
 
-    def _float(self, variable, name: str) -> float:
+    def _float(self, variable: TextValue, name: str) -> float:
         try:
             return float(variable.get())
         except ValueError as error:
@@ -848,17 +1582,28 @@ class VCStudioApp:
                 self.metric_underflow_var.set(metrics["underflows"])
             elif kind == "finished":
                 self._set_running(str(payload), False)
-        self.root.after(100, self._poll_ui_queue)
 
     def _log(self, message: str) -> None:
         timestamp = time.strftime("%H:%M:%S")
-        self.log_text.insert("end", f"[{timestamp}] {message}\n")
-        self.log_text.see("end")
+        cursor = self.log_text.textCursor()
+        cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
+        cursor.insertText(f"[{timestamp}] {message}\n")
+        self.log_text.setTextCursor(cursor)
+        self.log_text.ensureCursorVisible()
 
-    def _on_close(self) -> None:
+    def _shutdown(self) -> None:
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
         if self.live_stop_event is not None:
             self.live_stop_event.set()
         if self.offline_stop_event is not None:
             self.offline_stop_event.set()
         self.backend.shutdown()
-        self.root.destroy()
+
+    def _on_close(self) -> None:
+        self.close()
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self._shutdown()
+        event.accept()
