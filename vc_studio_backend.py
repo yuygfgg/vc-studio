@@ -23,6 +23,7 @@ warnings.filterwarnings(
 import numpy as np
 import soundfile as sf
 import torch
+import torchaudio.functional as torchaudio_functional
 
 from cosyvoice.vc.audio import mel_spectrogram_24000, read_mono, write_wav
 from cosyvoice.vc.model import VCOnlyModel, align_prompt_token_feat
@@ -548,6 +549,8 @@ class StreamSettings:
     prompt_cache_storage: str = "device"
     enable_grouped_prompt: bool = False
     enable_grouped_prompt_cache: bool = False
+    lavasr_enabled: bool = True
+    lavasr_lowpass_hz: float = 7800.0
 
 
 @dataclass(frozen=True)
@@ -817,6 +820,8 @@ def stream_context_log_lines(
         f"delayed_commit_tokens={context.delayed_commit_tokens} delayed_commit_seconds={context.delayed_commit_tokens / 25.0:.3f}",
         f"audio_declick_samples={context.audio_declick_samples} audio_declick_ms={context.audio_declick_samples / model.sample_rate * 1000:.3f}",
         f"max_audio_blend_samples={context.max_audio_blend_samples} audio_blend_ms={context.max_audio_blend_samples / model.sample_rate * 1000:.3f}",
+        f"lavasr_enabled={settings.lavasr_enabled}",
+        f"lavasr_lowpass_hz={settings.lavasr_lowpass_hz:g}",
         f"vad_enabled={settings.vad_enabled}",
         f"vad_threshold={settings.vad_threshold:.3f}",
         f"vad_min_speech_ms={settings.vad_min_speech_ms:.1f}",
@@ -849,11 +854,173 @@ def stream_context_log_lines(
     return lines
 
 
+LAVASR_INPUT_SAMPLE_RATE = 16000
+LAVASR_OUTPUT_SAMPLE_RATE = 48000
+DEFAULT_LAVASR_DEVICE = "cpu"
+
+
+def validate_lavasr_lowpass_hz(lowpass_hz: float, input_sample_rate: int = LAVASR_INPUT_SAMPLE_RATE) -> float:
+    lowpass_hz = float(lowpass_hz)
+    nyquist = input_sample_rate / 2.0
+    if lowpass_hz <= 0:
+        raise ValueError("LavaSR lowpass cutoff must be greater than 0 Hz.")
+    if lowpass_hz > nyquist:
+        raise ValueError(f"LavaSR lowpass cutoff must be <= {nyquist:g} Hz for {input_sample_rate} Hz input.")
+    return lowpass_hz
+
+
+class LavaSRBandwidthExtender:
+    input_sample_rate = LAVASR_INPUT_SAMPLE_RATE
+    output_sample_rate = LAVASR_OUTPUT_SAMPLE_RATE
+
+    def __init__(self, lowpass_hz: float, device: str = DEFAULT_LAVASR_DEVICE):
+        self.lowpass_hz = validate_lavasr_lowpass_hz(lowpass_hz)
+        self.device = device
+        try:
+            from LavaSR.enhancer.linkwitz_merge import FastLRMerge
+            from LavaSR.model import LavaEnhance2
+        except ImportError as error:
+            raise RuntimeError(
+                "LavaSR bandwidth extension is enabled but LavaSR is not installed. "
+                "Install requirements.txt, then restart VC Studio."
+            ) from error
+
+        model_path = resolve_lavasr_model_path()
+        try:
+            self.model = LavaEnhance2(model_path=model_path, device=device)
+        except Exception as error:
+            raise RuntimeError(
+                "LavaSR model weights could not be loaded. First use may need network access "
+                "to download YatharthS/LavaSR from Hugging Face."
+            ) from error
+        if hasattr(self.model, "bwe_model") and hasattr(self.model.bwe_model, "lr_refiner"):
+            refiner = FastLRMerge(cutoff=int(round(self.lowpass_hz)))
+            if hasattr(refiner, "to"):
+                refiner = refiner.to(getattr(self.model, "device", device))
+            self.model.bwe_model.lr_refiner = refiner
+
+    def enhance(self, audio: torch.Tensor, sample_rate: int) -> tuple[torch.Tensor, dict[str, Any]]:
+        start = time.perf_counter()
+        source_samples = int(audio.shape[-1])
+        lavasr_input = prepare_lavasr_input(
+            audio,
+            sample_rate=sample_rate,
+            target_sample_rate=self.input_sample_rate,
+            lowpass_hz=self.lowpass_hz,
+        )
+        with torch.inference_mode():
+            enhanced = self.model.enhance(lavasr_input.to(self.device), denoise=False)
+        enhanced = normalize_audio_tensor(enhanced)
+        target_samples = round(source_samples * self.output_sample_rate / sample_rate)
+        enhanced = fit_audio_length(enhanced, target_samples)
+        seconds = time.perf_counter() - start
+        return enhanced, {
+            "lavasr_enabled": True,
+            "lavasr_device": self.device,
+            "lavasr_lowpass_hz": self.lowpass_hz,
+            "lavasr_input_sample_rate": self.input_sample_rate,
+            "lavasr_output_sample_rate": self.output_sample_rate,
+            "lavasr_input_samples": int(lavasr_input.shape[-1]),
+            "lavasr_output_samples": int(enhanced.shape[-1]),
+            "lavasr_seconds": seconds,
+        }
+
+
+def resolve_lavasr_model_path(repo_id: str = "YatharthS/LavaSR") -> str:
+    try:
+        from huggingface_hub import snapshot_download
+
+        return snapshot_download(repo_id, local_files_only=True)
+    except Exception:
+        return repo_id
+
+
+def create_lavasr_extender(settings: StreamSettings, log_fn: Callable[[str], None] | None = None) -> LavaSRBandwidthExtender | None:
+    if not settings.lavasr_enabled:
+        return None
+    extender = LavaSRBandwidthExtender(settings.lavasr_lowpass_hz)
+    if log_fn is not None:
+        log_fn(
+            "lavasr_loaded=True "
+            f"device={extender.device} "
+            f"input_sample_rate={extender.input_sample_rate} "
+            f"output_sample_rate={extender.output_sample_rate} "
+            f"lowpass_hz={extender.lowpass_hz:g}"
+        )
+    return extender
+
+
+def normalize_audio_tensor(audio: Any) -> torch.Tensor:
+    if isinstance(audio, np.ndarray):
+        tensor = torch.from_numpy(audio)
+    elif isinstance(audio, torch.Tensor):
+        tensor = audio.detach().cpu()
+    else:
+        tensor = torch.as_tensor(audio)
+    tensor = tensor.float()
+    if tensor.dim() == 0:
+        return tensor.reshape(1, 1)
+    if tensor.dim() == 1:
+        return tensor.unsqueeze(0)
+    if tensor.dim() == 2:
+        if tensor.shape[0] == 1:
+            return tensor
+        return tensor.mean(dim=0, keepdim=True)
+    return tensor.reshape(1, -1)
+
+
+def prepare_lavasr_input(
+    audio: torch.Tensor,
+    sample_rate: int,
+    target_sample_rate: int,
+    lowpass_hz: float,
+) -> torch.Tensor:
+    audio = normalize_audio_tensor(audio)
+    if sample_rate <= 0:
+        raise ValueError("source sample rate must be positive")
+    lowpass_hz = validate_lavasr_lowpass_hz(lowpass_hz, target_sample_rate)
+    if sample_rate == target_sample_rate:
+        return audio
+    resample_nyquist = min(sample_rate, target_sample_rate) / 2.0
+    rolloff = min(0.99, max(0.01, lowpass_hz / resample_nyquist))
+    return torchaudio_functional.resample(
+        audio,
+        orig_freq=sample_rate,
+        new_freq=target_sample_rate,
+        lowpass_filter_width=32,
+        rolloff=rolloff,
+    )
+
+
+def fit_audio_length(audio: torch.Tensor, target_samples: int) -> torch.Tensor:
+    target_samples = max(0, int(target_samples))
+    if audio.shape[-1] == target_samples:
+        return audio
+    if audio.shape[-1] > target_samples:
+        return audio[..., :target_samples]
+    pad = target_samples - audio.shape[-1]
+    return torch.nn.functional.pad(audio, (0, pad))
+
+
+def add_lavasr_row_stats(row: dict, stats: dict[str, Any]) -> dict:
+    updated = dict(row)
+    lavasr_seconds = float(stats.get("lavasr_seconds", 0.0))
+    updated["lavasr_seconds"] = lavasr_seconds
+    updated["compute_seconds"] = float(updated.get("compute_seconds", 0.0)) + lavasr_seconds
+    updated["wall_end_seconds"] = float(updated.get("wall_end_seconds", 0.0)) + lavasr_seconds
+    input_seconds = float(updated.get("input_seconds", 0.0))
+    updated["chunk_rtf"] = updated["compute_seconds"] / input_seconds if input_seconds > 0 else 0.0
+    updated["output_seconds"] = stats.get("lavasr_output_samples", 0) / LAVASR_OUTPUT_SAMPLE_RATE
+    return updated
+
+
 def offline_summary_lines(
     model: VCOnlyModel,
     source_stats: dict,
     rows: list[dict],
     output: str | Path,
+    output_sample_rate: int | None = None,
+    postprocess_stats: dict[str, Any] | None = None,
 ) -> list[str]:
     source_tokens = source_stats["tokens"]
     source_seconds = source_tokens / 25.0
@@ -865,7 +1032,8 @@ def offline_summary_lines(
     avg_infer_rtf = infer_compute_seconds / source_seconds if source_seconds > 0 else 0.0
     avg_pipeline_rtf = pipeline_compute_seconds / source_seconds if source_seconds > 0 else 0.0
     wall_rtf = wall_pipeline_seconds / source_seconds if source_seconds > 0 else 0.0
-    return [
+    output_sample_rate = output_sample_rate or model.sample_rate
+    lines = [
         f"source_tokens={source_tokens} source_seconds={source_seconds:.3f}",
         f"source_tokenize_chunks={source_stats['chunks']}",
         f"source_tokenize_audio_seconds={source_stats['audio_seconds']:.3f}",
@@ -887,8 +1055,19 @@ def offline_summary_lines(
         f"wall_stream_rtf={wall_rtf:.3f}",
         f"max_chunk_compute_seconds={max_chunk_seconds:.3f}",
         f"chunks={len(rows)}",
+        f"output_sample_rate={output_sample_rate}",
         f"output={Path(output).resolve()}",
     ]
+    if postprocess_stats is not None:
+        lines.extend(
+            [
+                f"lavasr_output_sample_rate={postprocess_stats['lavasr_output_sample_rate']}",
+                f"lavasr_lowpass_hz={postprocess_stats['lavasr_lowpass_hz']:g}",
+                f"lavasr_compute_seconds={postprocess_stats['lavasr_seconds']:.3f}",
+                f"lavasr_rtf={postprocess_stats['lavasr_seconds'] / source_seconds if source_seconds > 0 else 0.0:.3f}",
+            ]
+        )
+    return lines
 
 
 def align_history_tokens(history_sec: float, model: VCOnlyModel) -> int:
@@ -2440,10 +2619,31 @@ class VCStudioBackend:
         source_stats = source_tokenizer.stats()
         if stop_event is not None and stop_event.is_set():
             log_fn("Offline job stopped by user.")
-        write_wav(config.output, speech, model.sample_rate)
+        output_sample_rate = model.sample_rate
+        postprocess_stats = None
+        if config.settings.lavasr_enabled:
+            status_fn("Enhancing with LavaSR...")
+            lavasr = create_lavasr_extender(config.settings, log_fn=log_fn)
+            if lavasr is not None:
+                speech, postprocess_stats = lavasr.enhance(speech, model.sample_rate)
+                output_sample_rate = lavasr.output_sample_rate
+                log_fn(
+                    "lavasr_offline "
+                    f"input_samples={postprocess_stats['lavasr_input_samples']} "
+                    f"output_samples={postprocess_stats['lavasr_output_samples']} "
+                    f"seconds={postprocess_stats['lavasr_seconds']:.3f}"
+                )
+        write_wav(config.output, speech, output_sample_rate)
         if config.csv:
             write_rows(config.csv, rows)
-        for line in offline_summary_lines(model, source_stats, rows, config.output):
+        for line in offline_summary_lines(
+            model,
+            source_stats,
+            rows,
+            config.output,
+            output_sample_rate=output_sample_rate,
+            postprocess_stats=postprocess_stats,
+        ):
             log_fn(line)
         status_fn("Offline benchmark finished.")
 
@@ -2468,10 +2668,17 @@ class VCStudioBackend:
             context = prepare_stream_context(model, config.voice_package or config.prompt, config.settings)
             for line in stream_context_log_lines(model, config.settings, context):
                 log_fn(line)
+            lavasr = None
+            output_sample_rate = model.sample_rate
+            if config.settings.lavasr_enabled:
+                status_fn("Loading LavaSR...")
+                lavasr = create_lavasr_extender(config.settings, log_fn=log_fn)
+                if lavasr is not None:
+                    output_sample_rate = lavasr.output_sample_rate
             status_fn("Loading Silero VAD..." if config.settings.vad_enabled else "Opening audio output...")
             vad_gate = create_vad_gate(config.settings)
             player = RealtimeAudioPlayer(
-                sample_rate=model.sample_rate,
+                sample_rate=output_sample_rate,
                 output_device=config.output_device,
                 log_fn=log_fn,
             )
@@ -2492,9 +2699,13 @@ class VCStudioBackend:
             status_fn("Live stream is running.")
 
             def handle_chunk(speech_chunk: torch.Tensor, row: dict) -> None:
+                metric_row = row
+                if lavasr is not None:
+                    speech_chunk, lavasr_stats = lavasr.enhance(speech_chunk, model.sample_rate)
+                    metric_row = add_lavasr_row_stats(row, lavasr_stats)
                 if player is not None:
                     player.write(speech_chunk)
-                    metrics_fn(row, player.stats())
+                    metrics_fn(metric_row, player.stats())
 
             run_window_stream(
                 model=model,

@@ -468,6 +468,8 @@ class VCStudioApp(QtWidgets.QMainWindow):
         self.delayed_commit_sec_var = TextValue(f"{args.delayed_commit_sec:g}")
         self.audio_declick_ms_var = TextValue(f"{args.audio_declick_ms:g}")
         self.audio_blend_ms_var = TextValue(f"{args.audio_blend_ms:g}")
+        self.lavasr_enabled_var = BoolValue(not getattr(args, "disable_lavasr", False))
+        self.lavasr_lowpass_hz_var = TextValue(f"{getattr(args, 'lavasr_lowpass_hz', 7800.0):g}")
         self.vad_enabled_var = BoolValue(args.enable_vad)
         self.vad_threshold_var = TextValue(f"{args.vad_threshold:g}")
         self.vad_min_speech_ms_var = TextValue(f"{args.vad_min_speech_ms:g}")
@@ -1201,6 +1203,20 @@ class VCStudioApp(QtWidgets.QMainWindow):
             self.audio_blend_ms_var,
             "Crossfades adjacent audio chunks. Raising it smooths joins, but can smear attacks and adds "
             "a small post-processing cost.",
+        )
+        self._checkbox_row(
+            quality_form,
+            "LavaSR BWE",
+            self.lavasr_enabled_var,
+            "Expands converted 24 kHz speech by lowpass/resampling it to 16 kHz, then running LavaSR to "
+            "produce 48 kHz output with synthesized high-band detail.",
+        )
+        self._number_row(
+            quality_form,
+            "LavaSR lowpass Hz",
+            self.lavasr_lowpass_hz_var,
+            "Cutoff used before the 16 kHz LavaSR input and as the low/high-band merge point. Higher values "
+            "preserve more original VC output; lower values let LavaSR replace more upper spectrum.",
         )
 
         self._checkbox_row(
@@ -2121,6 +2137,14 @@ class VCStudioApp(QtWidgets.QMainWindow):
         vad_min_speech_ms = self._nonnegative_float(self.vad_min_speech_ms_var, "VAD min speech ms")
         vad_min_silence_ms = self._nonnegative_float(self.vad_min_silence_ms_var, "VAD min silence ms")
         vad_speech_pad_ms = self._nonnegative_float(self.vad_speech_pad_ms_var, "VAD speech pad ms")
+        lavasr_enabled = self.lavasr_enabled_var.get()
+        lavasr_lowpass_hz = self._float_in_range(self.lavasr_lowpass_hz_var, "LavaSR lowpass Hz", 1.0, 8000.0)
+        if lavasr_enabled:
+            if importlib.util.find_spec("LavaSR") is None:
+                raise ValueError(
+                    "LavaSR BWE is enabled, but the optional LavaSR package is not installed. "
+                    "Install requirements.txt, then restart the GUI."
+                )
         if vad_enabled:
             if importlib.util.find_spec("silero_vad") is None:
                 raise ValueError(
@@ -2160,6 +2184,8 @@ class VCStudioApp(QtWidgets.QMainWindow):
             prompt_cache_storage=prompt_cache_storage,
             enable_grouped_prompt=self.grouped_prompt_var.get(),
             enable_grouped_prompt_cache=self.grouped_prompt_var.get() and self.grouped_prompt_cache_var.get(),
+            lavasr_enabled=lavasr_enabled,
+            lavasr_lowpass_hz=lavasr_lowpass_hz,
         )
 
     def _positive_float(self, variable: TextValue, name: str) -> float:

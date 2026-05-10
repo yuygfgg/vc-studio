@@ -69,6 +69,7 @@ python3 vc_studio.py \
   --model-dir pretrained_models/Fun-CosyVoice3-0.5B-2512 \
   --device auto \
   --ort-provider auto \
+  --lavasr-lowpass-hz 7800 \
   --prompt-cache-max-mb 1024 \
   --prompt-cache-max-seconds 0 \
   --prompt-cache-dtype auto \
@@ -158,10 +159,15 @@ utterance. VC Studio uses several mechanisms to keep neighboring chunks coherent
 - Audio boundary repair: optional waveform crossfade and de-click correction can
   smooth remaining sample-level discontinuities. Optional VAD gating applies
   fades when muting nonspeech regions.
+- LavaSR bandwidth extension: enabled by default. Converted 24 kHz chunks are
+  lowpass/resampled to 16 kHz, passed through LavaSR, and emitted as 48 kHz audio.
+  Use `--lavasr-lowpass-hz` to choose the 16 kHz cutoff/merge point, or
+  `--disable-lavasr` to keep the original 24 kHz HiFT output.
 
 The main quality/latency knobs are `--history-sec`, `--mel-overlap-sec`,
-`--delayed-commit-sec`, `--audio-blend-ms`, and `--audio-declick-ms`. Larger
-values usually improve joins and stability, while smaller values reduce latency.
+`--delayed-commit-sec`, `--audio-blend-ms`, `--audio-declick-ms`, and
+`--lavasr-lowpass-hz`. Larger context/repair values usually improve joins and
+stability, while smaller values reduce latency.
 
 ## Multi-Prompt Timbre Fusion
 

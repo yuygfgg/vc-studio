@@ -2,6 +2,7 @@ conformer==0.3.2
 diffusers==0.29.0
 einops>=0.8
 librosa>=0.10.2
+LavaSR @ git+https://github.com/ysharma3501/LavaSR.git@308d9f9ccc552a342b1c326affda19a977ca08f0
 numpy>=1.26
 omegaconf==2.3.0
 onnxruntime>=1.18

@@ -31,6 +31,8 @@ def main() -> None:
     parser.add_argument("--delayed-commit-sec", type=float, default=0.5, help="Prefill delayed commit")
     parser.add_argument("--audio-declick-ms", type=float, default=0.0, help="Prefill waveform de-click")
     parser.add_argument("--audio-blend-ms", type=float, default=0.0, help="Prefill waveform crossfade")
+    parser.add_argument("--disable-lavasr", action="store_true", help="Prefill LavaSR bandwidth extension off")
+    parser.add_argument("--lavasr-lowpass-hz", type=float, default=7800.0, help="Prefill LavaSR 16 kHz input lowpass cutoff")
     parser.add_argument("--enable-vad", action="store_true", help="Prefill Silero VAD noise gate on")
     parser.add_argument("--vad-threshold", type=float, default=0.5, help="Prefill Silero VAD speech threshold")
     parser.add_argument("--vad-min-speech-ms", type=float, default=100.0, help="Prefill Silero VAD minimum speech duration")
