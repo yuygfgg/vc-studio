@@ -352,7 +352,19 @@ class CausalConditionalCFM(ConditionalCFM):
         noise = torch.randn([1, 80, end], generator=generator)
         return noise[:, :, start:end].to(device=device, dtype=dtype)
 
-    def prepare_prompt_cache(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None, streaming=False):
+    def prepare_prompt_cache(
+        self,
+        mu,
+        mask,
+        n_timesteps,
+        temperature=1.0,
+        spks=None,
+        cond=None,
+        streaming=False,
+        cache_storage_dtype=None,
+        cache_target_device=None,
+        keep_prompt_inputs=True,
+    ):
         prompt_len = mu.size(2)
         z = self.rand_noise[:, :, :prompt_len].to(mu.device).to(mu.dtype) * temperature
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
@@ -375,9 +387,14 @@ class CausalConditionalCFM(ConditionalCFM):
             )
             prompt_dphi, prompt_cfg_dphi = torch.split(prompt_out, [prompt_x.size(0), prompt_x.size(0)], dim=0)
             prompt_dphi = ((1.0 + self.inference_cfg_rate) * prompt_dphi - self.inference_cfg_rate * prompt_cfg_dphi)
+            prompt_cache = self.optimize_prompt_cache_step_for_storage(
+                prompt_cache,
+                storage_dtype=cache_storage_dtype,
+                target_device=cache_target_device,
+            )
             steps.append({
                 "prompt_cache": prompt_cache,
-                "prompt_inputs": prompt_inputs,
+                "prompt_inputs": prompt_inputs if keep_prompt_inputs else None,
             })
             prompt_x = prompt_x + dt * prompt_dphi
             t = t + dt
@@ -391,6 +408,48 @@ class CausalConditionalCFM(ConditionalCFM):
             "history_cache_len": 0,
             "base_cache": None,
         }
+
+    def optimize_prompt_cache_step_for_storage(self, prompt_cache, storage_dtype=None, target_device=None):
+        if storage_dtype is None and target_device is None:
+            return prompt_cache
+        prompt_cache = dict(prompt_cache)
+        if "kv" in prompt_cache:
+            prompt_cache["kv"] = [
+                (
+                    self.optimize_cache_tensor(key, storage_dtype, target_device),
+                    self.optimize_cache_tensor(value, storage_dtype, target_device),
+                )
+                for key, value in prompt_cache["kv"]
+            ]
+        input_embed_cache = prompt_cache.get("input_embed_cache")
+        if isinstance(input_embed_cache, dict):
+            prompt_cache["input_embed_cache"] = self.optimize_cache_tree(
+                input_embed_cache,
+                storage_dtype,
+                target_device,
+            )
+        return prompt_cache
+
+    def optimize_cache_tree(self, value, storage_dtype=None, target_device=None):
+        if isinstance(value, torch.Tensor):
+            return self.optimize_cache_tensor(value, storage_dtype, target_device)
+        if isinstance(value, dict):
+            return {key: self.optimize_cache_tree(item, storage_dtype, target_device) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self.optimize_cache_tree(item, storage_dtype, target_device) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self.optimize_cache_tree(item, storage_dtype, target_device) for item in value)
+        return value
+
+    def optimize_cache_tensor(self, tensor, storage_dtype=None, target_device=None):
+        kwargs = {}
+        if tensor.is_floating_point() and storage_dtype is not None:
+            kwargs["dtype"] = storage_dtype
+        if target_device is not None:
+            kwargs["device"] = target_device
+        if not kwargs:
+            return tensor
+        return tensor.to(**kwargs)
 
     def solve_euler_prompt_cache(self, x, t_span, mu, mask, spks, cond, prompt_len, source_mel_offset=0, streaming=False):
         if prompt_len <= 0:
@@ -488,6 +547,8 @@ class CausalConditionalCFM(ConditionalCFM):
         source_mu = mu[:, :, prompt_len:]
         source_cond = cond[:, :, prompt_len:]
         collect_source_cache = source_cache_len > 0
+        source_cache_end = source_x.shape[2] if source_cache_end <= 0 else min(source_cache_end, source_x.shape[2])
+        source_cache_start = max(0, source_cache_end - source_cache_len)
 
         source_step_caches = []
         for step, step_cache in enumerate(prompt_cache_steps["steps"], start=1):
@@ -503,6 +564,12 @@ class CausalConditionalCFM(ConditionalCFM):
                 source_mel_offset=source_mel_offset,
             )
             if collect_source_cache:
+                source_step_cache = self.prepare_source_step_cache_for_history_storage(
+                    source_step_cache,
+                    step_cache["prompt_cache"],
+                    source_cache_start,
+                    source_cache_end,
+                )
                 source_step_caches.append(source_step_cache)
             source_dphi, source_cfg_dphi = torch.split(source_dphi, [x.size(0), x.size(0)], dim=0)
             source_dphi = ((1.0 + self.inference_cfg_rate) * source_dphi - self.inference_cfg_rate * source_cfg_dphi)
@@ -621,29 +688,69 @@ class CausalConditionalCFM(ConditionalCFM):
 
         steps = []
         for base_step, source_step in zip(base_cache["steps"], source_step_caches):
+            base_prompt_cache = base_step["prompt_cache"]
             source_cache = source_step["source_cache"]
             source_inputs = source_step["source_inputs"]
+            source_step_start = source_step.get("source_cache_start")
+            source_step_end = source_step.get("source_cache_end")
+            source_step_is_sliced = source_step_start == source_start and source_step_end == source_end
+            source_input_start = 0 if source_step_is_sliced else source_start
+            source_input_end = history_len if source_step_is_sliced else source_end
             input_embed_cache = None
             if isinstance(self.estimator, torch.nn.Module):
                 input_embed_cache = self.estimator.extend_input_embed_cache(
-                    base_step["prompt_cache"].get("input_embed_cache"),
-                    source_inputs["x_source_in"][:, :, source_start:source_end],
-                    source_inputs["source_mu_in"][:, :, source_start:source_end],
-                    source_inputs["source_cond_in"][:, :, source_start:source_end],
+                    base_prompt_cache.get("input_embed_cache"),
+                    source_inputs["x_source_in"][:, :, source_input_start:source_input_end],
+                    source_inputs["source_mu_in"][:, :, source_input_start:source_input_end],
+                    source_inputs["source_cond_in"][:, :, source_input_start:source_input_end],
                     base_step["prompt_inputs"]["spks_in"],
                 )
-            prompt_cache = {
-                "kv": base_step["prompt_cache"]["kv"],
-                "history_kv": [
-                    (
-                        key[:, :, source_start:source_end].detach(),
-                        value[:, :, source_start:source_end].detach(),
+            if base_prompt_cache.get("grouped_branch_attention"):
+                if base_prompt_cache.get("grouped_attention_mode") == "sequential":
+                    base_kv = base_prompt_cache["sequential_branch_caches"][0]["kv"]
+                else:
+                    base_kv = base_prompt_cache["grouped_kv"]
+                if source_step_is_sliced:
+                    history_kv = source_cache["kv"]
+                else:
+                    history_kv = self._slice_history_kv_like_base_cache(
+                        source_cache["kv"],
+                        base_kv,
+                        source_start,
+                        source_end,
                     )
-                    for key, value in source_cache["kv"]
-                ],
-                "prompt_len": base_len + history_len,
-                "base_prompt_len": base_len,
-            }
+                prompt_cache = {
+                    "grouped_branch_attention": True,
+                    "grouped_attention_mode": base_prompt_cache.get("grouped_attention_mode", "vectorized"),
+                    "branch_weights": base_prompt_cache["branch_weights"],
+                    "branch_indices": base_prompt_cache.get("branch_indices"),
+                    "branch_cache_lens": base_prompt_cache.get("branch_cache_lens"),
+                    "attention_temperature": base_prompt_cache.get("attention_temperature", 1.0),
+                    "history_kv": history_kv,
+                    "prompt_len": base_len + history_len,
+                    "base_prompt_len": base_len,
+                }
+                if base_prompt_cache.get("grouped_attention_mode") == "sequential":
+                    prompt_cache["sequential_branch_caches"] = base_prompt_cache["sequential_branch_caches"]
+                else:
+                    prompt_cache["grouped_kv"] = base_prompt_cache["grouped_kv"]
+                    prompt_cache["grouped_prompt_mask"] = base_prompt_cache["grouped_prompt_mask"]
+            else:
+                if source_step_is_sliced:
+                    history_kv = source_cache["kv"]
+                else:
+                    history_kv = self._slice_history_kv_like_base_cache(
+                        source_cache["kv"],
+                        base_prompt_cache["kv"],
+                        source_start,
+                        source_end,
+                    )
+                prompt_cache = {
+                    "kv": base_prompt_cache["kv"],
+                    "history_kv": history_kv,
+                    "prompt_len": base_len + history_len,
+                    "base_prompt_len": base_len,
+                }
             if input_embed_cache is not None:
                 prompt_cache["input_embed_cache"] = input_embed_cache
             steps.append({
@@ -652,9 +759,9 @@ class CausalConditionalCFM(ConditionalCFM):
                     "x_prompt_in": base_step["prompt_inputs"]["x_prompt_in"],
                     "prompt_mu_in": base_step["prompt_inputs"]["prompt_mu_in"],
                     "prompt_cond_in": base_step["prompt_inputs"]["prompt_cond_in"],
-                    "history_x_in": source_inputs["x_source_in"][:, :, source_start:source_end].detach(),
-                    "history_mu_in": source_inputs["source_mu_in"][:, :, source_start:source_end].detach(),
-                    "history_cond_in": source_inputs["source_cond_in"][:, :, source_start:source_end].detach(),
+                    "history_x_in": source_inputs["x_source_in"][:, :, source_input_start:source_input_end].detach(),
+                    "history_mu_in": source_inputs["source_mu_in"][:, :, source_input_start:source_input_end].detach(),
+                    "history_cond_in": source_inputs["source_cond_in"][:, :, source_input_start:source_input_end].detach(),
                     "t_in": base_step["prompt_inputs"]["t_in"],
                     "spks_in": base_step["prompt_inputs"]["spks_in"],
                 },
@@ -671,6 +778,55 @@ class CausalConditionalCFM(ConditionalCFM):
             "history_cache_len": history_len,
             "base_cache": base_cache,
         }
+
+    def prepare_source_step_cache_for_history_storage(self, source_step_cache, prompt_cache, source_start, source_end):
+        if source_step_cache is None:
+            return None
+        source_start = max(0, int(source_start))
+        source_end = max(source_start, int(source_end))
+        base_kv = self.prompt_cache_base_kv(prompt_cache)
+        source_cache = source_step_cache["source_cache"]
+        if base_kv is not None:
+            source_cache = {
+                "kv": self._slice_history_kv_like_base_cache(
+                    source_cache["kv"],
+                    base_kv,
+                    source_start,
+                    source_end,
+                ),
+                "source_len": source_end - source_start,
+            }
+        source_inputs = {
+            key: value[:, :, source_start:source_end].detach()
+            for key, value in source_step_cache["source_inputs"].items()
+        }
+        return {
+            "source_cache": source_cache,
+            "source_inputs": source_inputs,
+            "source_cache_start": source_start,
+            "source_cache_end": source_end,
+        }
+
+    def prompt_cache_base_kv(self, prompt_cache):
+        if prompt_cache.get("grouped_branch_attention"):
+            if prompt_cache.get("grouped_attention_mode") == "sequential":
+                branch_caches = prompt_cache.get("sequential_branch_caches") or []
+                if not branch_caches:
+                    return None
+                return branch_caches[0].get("kv")
+            return prompt_cache.get("grouped_kv")
+        return prompt_cache.get("kv")
+
+    def _slice_history_kv_like_base_cache(self, source_kv, base_kv, source_start, source_end):
+        history_kv = []
+        for (key, value), (base_key, base_value) in zip(source_kv, base_kv):
+            history_kv.append(
+                (
+                    key[:, :, source_start:source_end].detach().to(device=base_key.device, dtype=base_key.dtype),
+                    value[:, :, source_start:source_end].detach().to(device=base_value.device, dtype=base_value.dtype),
+                )
+            )
+        return history_kv
 
     def forward_prompt_cache_only(self, prompt_x, prompt_mask, prompt_mu, t, spks, prompt_cond, streaming=False):
         batch = prompt_x.size(0)

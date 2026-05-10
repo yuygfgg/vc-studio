@@ -333,7 +333,10 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
                              prompt_feat,
                              prompt_feat_len,
                              embedding,
-                             streaming):
+                             streaming,
+                             cache_storage_dtype=None,
+                             cache_target_device=None,
+                             keep_prompt_inputs=True):
         assert prompt_token.shape[0] == 1
         embedding = F.normalize(embedding, dim=1)
         embedding = self.spk_embed_affine_layer(embedding)
@@ -358,6 +361,9 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
             spks=embedding,
             cond=cond,
             streaming=streaming,
+            cache_storage_dtype=cache_storage_dtype,
+            cache_target_device=cache_target_device,
+            keep_prompt_inputs=keep_prompt_inputs,
         )
         cache_token_len = min(prompt_token.shape[1], cache_len // self.token_mel_ratio)
         cache["flow_token_tail"] = self._conditioning_tail_from_embedding(token[:, :cache_token_len])

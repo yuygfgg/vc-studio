@@ -247,6 +247,13 @@ class DiT(nn.Module):
         chunk_mask = positions.unsqueeze(0) < block_end.unsqueeze(1)
         return (mask & chunk_mask.unsqueeze(0)).unsqueeze(dim=1)
 
+    def source_attention_query_chunk_size(self, query_len, prompt_len):
+        if int(prompt_len) <= 0 or int(query_len) <= 32:
+            return None
+        if self.static_chunk_size > 0:
+            return max(1, min(32, int(self.static_chunk_size)))
+        return 32
+
     def forward_prompt_cache(self, x, mask, mu, t, spks=None, cond=None, streaming=False):
         x = x.transpose(1, 2)
         mu = mu.transpose(1, 2)
@@ -260,14 +267,39 @@ class DiT(nn.Module):
         x, input_embed_cache = self.input_embed.forward_return_cache(x, cond, mu, spks.squeeze(1))
         rope = self.rotary_embed.forward_from_seq_len(seq_len)
 
-        if streaming is True:
-            attn_mask = add_optional_chunk_mask(x, mask.bool(), False, False, 0, self.static_chunk_size, -1).unsqueeze(dim=1)
+        prompt_mask = mask.bool()
+        prefix_chunk_size = None
+        if streaming is True and self.static_chunk_size > 0 and bool(prompt_mask.all().item()):
+            prefix_chunk_size = self.static_chunk_size
+
+        if prefix_chunk_size is not None:
+            attn_mask = None
+        elif streaming is True:
+            attn_mask = add_optional_chunk_mask(
+                x,
+                prompt_mask,
+                False,
+                False,
+                0,
+                self.static_chunk_size,
+                -1,
+            ).unsqueeze(dim=1)
         else:
-            attn_mask = add_optional_chunk_mask(x, mask.bool(), False, False, 0, 0, -1).repeat(1, x.size(1), 1).unsqueeze(dim=1)
+            attn_mask = (
+                add_optional_chunk_mask(x, prompt_mask, False, False, 0, 0, -1)
+                .repeat(1, x.size(1), 1)
+                .unsqueeze(dim=1)
+            )
 
         cache = []
         for block in self.transformer_blocks:
-            x, key, value = block.forward_return_kv(x, t, mask=attn_mask.bool(), rope=rope)
+            x, key, value = block.forward_return_kv(
+                x,
+                t,
+                mask=attn_mask.bool() if attn_mask is not None else None,
+                rope=rope,
+                prefix_chunk_size=prefix_chunk_size,
+            )
             cache.append((key, value))
 
         x = self.norm_out(x, t)
@@ -349,40 +381,98 @@ class DiT(nn.Module):
         else:
             attn_mask = mask.bool().repeat(1, seq_len, 1).unsqueeze(dim=1)
         attn_mask = attn_mask[:, :, prompt_len:, :]
+        source_query_chunk_size = self.source_attention_query_chunk_size(x_len, prompt_len)
 
         source_cache = []
         if prompt_cache.get("grouped_branch_attention"):
-            grouped_kv = prompt_cache["grouped_kv"]
-            grouped_prompt_mask = prompt_cache["grouped_prompt_mask"]
             branch_weights = prompt_cache["branch_weights"]
             attention_temperature = float(prompt_cache.get("attention_temperature", 1.0))
-            for block, (prompt_key, prompt_value) in zip(self.transformer_blocks, grouped_kv):
-                if return_source_cache:
-                    x, source_key, source_value = block.forward_with_grouped_prompt_kv(
-                        x,
-                        t,
-                        prompt_key,
-                        prompt_value,
-                        grouped_prompt_mask,
-                        branch_weights,
-                        mask=attn_mask.bool(),
-                        rope=rope,
-                        return_kv=True,
-                        attention_temperature=attention_temperature,
-                    )
-                    source_cache.append((source_key, source_value))
+            history_kv = prompt_cache.get("history_kv")
+            if prompt_cache.get("grouped_attention_mode") == "sequential":
+                sequential_branch_caches = prompt_cache["sequential_branch_caches"]
+                for block_index, block in enumerate(self.transformer_blocks):
+                    history_pair = history_kv[block_index] if history_kv is not None else None
+                    history_key, history_value = history_pair if history_pair is not None else (None, None)
+                    branch_kv = [
+                        (
+                            branch_cache["kv"][block_index][0],
+                            branch_cache["kv"][block_index][1],
+                            branch_cache["prompt_mask"],
+                        )
+                        for branch_cache in sequential_branch_caches
+                    ]
+                    if return_source_cache:
+                        x, source_key, source_value = block.forward_with_sequential_grouped_prompt_kv(
+                            x,
+                            t,
+                            branch_kv,
+                            branch_weights,
+                            mask=attn_mask.bool(),
+                            rope=rope,
+                            return_kv=True,
+                            attention_temperature=attention_temperature,
+                            history_key=history_key,
+                            history_value=history_value,
+                            query_chunk_size=source_query_chunk_size,
+                        )
+                        source_cache.append((source_key, source_value))
+                    else:
+                        x = block.forward_with_sequential_grouped_prompt_kv(
+                            x,
+                            t,
+                            branch_kv,
+                            branch_weights,
+                            mask=attn_mask.bool(),
+                            rope=rope,
+                            attention_temperature=attention_temperature,
+                            history_key=history_key,
+                            history_value=history_value,
+                            query_chunk_size=source_query_chunk_size,
+                        )
+            else:
+                grouped_kv = prompt_cache["grouped_kv"]
+                grouped_prompt_mask = prompt_cache["grouped_prompt_mask"]
+                if history_kv is None:
+                    grouped_kv_iter = ((block, prompt_kv, None) for block, prompt_kv in zip(self.transformer_blocks, grouped_kv))
                 else:
-                    x = block.forward_with_grouped_prompt_kv(
-                        x,
-                        t,
-                        prompt_key,
-                        prompt_value,
-                        grouped_prompt_mask,
-                        branch_weights,
-                        mask=attn_mask.bool(),
-                        rope=rope,
-                        attention_temperature=attention_temperature,
+                    grouped_kv_iter = (
+                        (block, prompt_kv, hist_kv)
+                        for block, prompt_kv, hist_kv in zip(self.transformer_blocks, grouped_kv, history_kv)
                     )
+                for block, (prompt_key, prompt_value), history_pair in grouped_kv_iter:
+                    history_key, history_value = history_pair if history_pair is not None else (None, None)
+                    if return_source_cache:
+                        x, source_key, source_value = block.forward_with_grouped_prompt_kv(
+                            x,
+                            t,
+                            prompt_key,
+                            prompt_value,
+                            grouped_prompt_mask,
+                            branch_weights,
+                            mask=attn_mask.bool(),
+                            rope=rope,
+                            return_kv=True,
+                            attention_temperature=attention_temperature,
+                            history_key=history_key,
+                            history_value=history_value,
+                            query_chunk_size=source_query_chunk_size,
+                        )
+                        source_cache.append((source_key, source_value))
+                    else:
+                        x = block.forward_with_grouped_prompt_kv(
+                            x,
+                            t,
+                            prompt_key,
+                            prompt_value,
+                            grouped_prompt_mask,
+                            branch_weights,
+                            mask=attn_mask.bool(),
+                            rope=rope,
+                            attention_temperature=attention_temperature,
+                            history_key=history_key,
+                            history_value=history_value,
+                            query_chunk_size=source_query_chunk_size,
+                        )
 
             x = self.norm_out(x, t)
             output = self.proj_out(x).transpose(1, 2)
@@ -416,10 +506,19 @@ class DiT(nn.Module):
                     mask=attn_mask.bool(),
                     rope=rope,
                     return_kv=True,
+                    query_chunk_size=source_query_chunk_size,
                 )
                 source_cache.append((source_key, source_value))
             else:
-                x = block.forward_with_prompt_kv(x, t, prompt_key, prompt_value, mask=attn_mask.bool(), rope=rope)
+                x = block.forward_with_prompt_kv(
+                    x,
+                    t,
+                    prompt_key,
+                    prompt_value,
+                    mask=attn_mask.bool(),
+                    rope=rope,
+                    query_chunk_size=source_query_chunk_size,
+                )
 
         x = self.norm_out(x, t)
         output = self.proj_out(x).transpose(1, 2)

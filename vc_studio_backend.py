@@ -26,6 +26,7 @@ import torch
 import torchaudio.functional as torchaudio_functional
 
 from cosyvoice.vc.audio import mel_spectrogram_24000, read_mono, write_wav
+from cosyvoice.vc.device import empty_cache as empty_device_cache
 from cosyvoice.vc.model import VCOnlyModel, align_prompt_token_feat
 from cosyvoice.vc.voice_package import (
     APP_VERSION,
@@ -101,10 +102,7 @@ def prepare_grouped_prompt_cache(
     if dominant_index not in active_indices:
         dominant_index = active_indices[0]
 
-    branch_caches = []
-    dominant_token = None
-    dominant_feat = None
-    dominant_cache = None
+    branch_specs = []
     for branch_index in active_indices:
         branch = prompt_inputs.branches[branch_index]
         branch_token, branch_feat = trim_prompt_to_static_cache(
@@ -113,6 +111,40 @@ def prepare_grouped_prompt_cache(
             model,
             max_mel_frames=max_cache_mel_frames,
         )
+        expected_cache_len = trim_cache_mel_frames_to_static(model, branch_feat.shape[1])
+        if expected_cache_len <= 0:
+            raise ValueError(
+                "multi-branch voice packages require each active reference to be long enough for static prompt cache"
+            )
+        branch_specs.append(
+            {
+                "branch_index": branch_index,
+                "branch": branch,
+                "prompt_token": branch_token,
+                "prompt_feat": branch_feat,
+                "weight": float(sharpened_weights[branch_index]),
+                "expected_cache_len": int(expected_cache_len),
+            }
+        )
+
+    branch_weights = torch.tensor(
+        [record["weight"] for record in branch_specs],
+        dtype=torch.float32,
+        device=model.device,
+    )
+    cache_target_device = torch.device("cpu") if offload_kv_to_cpu else None
+    steps = None
+    dominant_token = None
+    dominant_feat = None
+    dominant_cache_len = 0
+    final_prompt_x = None
+    flow_token_tail = None
+
+    for branch_position, spec in enumerate(branch_specs):
+        branch_index = spec["branch_index"]
+        branch = spec["branch"]
+        branch_token = spec["prompt_token"]
+        branch_feat = spec["prompt_feat"]
         token_len = torch.tensor([branch_token.shape[1]], dtype=torch.int32, device=model.device)
         feat_len = torch.tensor([branch_feat.shape[1]], dtype=torch.int32, device=model.device)
         cache_len, cache = model.flow.prepare_prompt_cache(
@@ -122,103 +154,161 @@ def prepare_grouped_prompt_cache(
             prompt_feat_len=feat_len,
             embedding=branch.embedding,
             streaming=streaming,
+            cache_storage_dtype=cache_storage_dtype,
+            cache_target_device=cache_target_device,
+            keep_prompt_inputs=branch_index == dominant_index,
         )
         if cache is None or cache_len <= 0:
             raise ValueError(
                 "multi-branch voice packages require each active reference to be long enough for static prompt cache"
             )
-        optimize_prompt_cache_storage(cache, cache_storage_dtype, offload_kv_to_cpu=offload_kv_to_cpu)
-        branch_record = {
-            "branch_index": branch_index,
-            "weight": float(sharpened_weights[branch_index]),
-            "cache_len": int(cache_len),
-            "cache": cache,
-        }
-        branch_caches.append(branch_record)
+        spec["cache_len"] = int(cache_len)
+        if steps is None:
+            steps = _create_sequential_grouped_prompt_cache_steps(
+                cache,
+                branch_weights=branch_weights,
+            )
+        _append_branch_prompt_cache_to_sequential_steps(
+            steps,
+            cache,
+            branch_position=branch_position,
+            branch_index=branch_index,
+            cache_len=int(cache_len),
+            storage_dtype=cache_storage_dtype,
+            target_device=cache_target_device,
+        )
         if branch_index == dominant_index:
             dominant_token = branch_token
             dominant_feat = branch_feat
-            dominant_cache = cache
+            dominant_cache_len = int(cache_len)
+            final_prompt_x = cache["final_prompt_x"]
+            flow_token_tail = cache.get("flow_token_tail")
+            _attach_dominant_grouped_prompt_inputs(
+                steps,
+                cache,
+                fused_embedding=prompt_inputs.fused_embedding,
+                model=model,
+                storage_dtype=cache_storage_dtype,
+                target_device=cache_target_device,
+                attention_temperature=float(prompt_inputs.metadata.get("attention_temperature", 1.0)),
+            )
 
-    if dominant_token is None or dominant_feat is None or dominant_cache is None:
+        del cache
+        sync_device(model.device)
+        empty_device_cache(model.device)
+
+    if dominant_token is None or dominant_feat is None or final_prompt_x is None or steps is None:
         raise ValueError("dominant prompt branch was not prepared")
 
-    fused_spks = torch.nn.functional.normalize(prompt_inputs.fused_embedding, dim=1)
-    fused_spks = model.flow.spk_embed_affine_layer(fused_spks)
-    branch_weights = torch.tensor(
-        [record["weight"] for record in branch_caches],
-        dtype=torch.float32,
-        device=model.device,
-    )
-    steps = []
-    for step_index, dominant_step in enumerate(dominant_cache["steps"]):
-        branch_prompt_caches = [record["cache"]["steps"][step_index]["prompt_cache"] for record in branch_caches]
-        grouped_kv, grouped_mask = _stack_grouped_prompt_kv(branch_prompt_caches)
-        prompt_inputs_for_step = dict(dominant_step["prompt_inputs"])
-        spks_in = torch.zeros_like(prompt_inputs_for_step["spks_in"])
-        spks_in[: fused_spks.shape[0]] = fused_spks
-        prompt_inputs_for_step["spks_in"] = spks_in
-        steps.append(
-            {
-                "prompt_cache": {
-                    "grouped_branch_attention": True,
-                    "grouped_kv": grouped_kv,
-                    "grouped_prompt_mask": grouped_mask,
-                    "branch_weights": branch_weights,
-                    "branch_indices": [record["branch_index"] for record in branch_caches],
-                    "branch_cache_lens": [record["cache_len"] for record in branch_caches],
-                    "prompt_len": int(dominant_cache["cache_len"]),
-                    "base_prompt_len": int(dominant_cache["cache_len"]),
-                    "input_embed_cache": dominant_step["prompt_cache"].get("input_embed_cache"),
-                    "attention_temperature": float(prompt_inputs.metadata.get("attention_temperature", 1.0)),
-                },
-                "prompt_inputs": prompt_inputs_for_step,
-            }
-        )
+    for step in steps:
+        prompt_cache = step["prompt_cache"]
+        prompt_cache["prompt_len"] = int(dominant_cache_len)
+        prompt_cache["base_prompt_len"] = int(dominant_cache_len)
+        prompt_cache["branch_indices"] = [record["branch_index"] for record in branch_specs]
+        prompt_cache["branch_cache_lens"] = [
+            int(record.get("cache_len", record["expected_cache_len"])) for record in branch_specs
+        ]
 
     grouped_cache = {
         "grouped_branch_attention": True,
         "steps": steps,
-        "final_prompt_x": dominant_cache["final_prompt_x"],
-        "cache_len": int(dominant_cache["cache_len"]),
-        "base_cache_len": int(dominant_cache["cache_len"]),
+        "final_prompt_x": final_prompt_x,
+        "cache_len": int(dominant_cache_len),
+        "base_cache_len": int(dominant_cache_len),
         "history_cache_len": 0,
         "base_cache": None,
-        "flow_token_tail": dominant_cache.get("flow_token_tail"),
-        "branch_indices": [record["branch_index"] for record in branch_caches],
-        "branch_weights": [record["weight"] for record in branch_caches],
+        "flow_token_tail": flow_token_tail,
+        "branch_indices": [record["branch_index"] for record in branch_specs],
+        "branch_weights": [record["weight"] for record in branch_specs],
     }
-    return dominant_token, dominant_feat, prompt_inputs.fused_embedding, dominant_index, int(dominant_cache["cache_len"]), grouped_cache
+    return dominant_token, dominant_feat, prompt_inputs.fused_embedding, dominant_index, int(dominant_cache_len), grouped_cache
 
 
-def _stack_grouped_prompt_kv(
-    branch_prompt_caches: list[dict[str, Any]],
-) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
-    depth = len(branch_prompt_caches[0]["kv"])
-    grouped_kv = []
-    grouped_mask = None
-    for block_index in range(depth):
-        keys = [cache["kv"][block_index][0] for cache in branch_prompt_caches]
-        values = [cache["kv"][block_index][1] for cache in branch_prompt_caches]
-        max_len = max(key.shape[2] for key in keys)
-        first_key = keys[0]
-        first_value = values[0]
-        key_stack = first_key.new_zeros((len(keys), first_key.shape[0], first_key.shape[1], max_len, first_key.shape[3]))
-        value_stack = first_value.new_zeros(
-            (len(values), first_value.shape[0], first_value.shape[1], max_len, first_value.shape[3])
+def _create_sequential_grouped_prompt_cache_steps(
+    branch_cache: dict[str, Any],
+    *,
+    branch_weights: torch.Tensor,
+) -> list[dict[str, Any]]:
+    steps = []
+    for _ in branch_cache["steps"]:
+        steps.append(
+            {
+                "prompt_cache": {
+                    "grouped_branch_attention": True,
+                    "grouped_attention_mode": "sequential",
+                    "sequential_branch_caches": [],
+                    "branch_weights": branch_weights,
+                    "branch_indices": [],
+                    "branch_cache_lens": [],
+                    "prompt_len": 0,
+                    "base_prompt_len": 0,
+                },
+                "prompt_inputs": None,
+            }
         )
-        mask = torch.zeros((len(keys), max_len), dtype=torch.bool, device=first_key.device)
-        for branch_pos, (key, value) in enumerate(zip(keys, values)):
-            length = key.shape[2]
-            key_stack[branch_pos, :, :, :length] = key
-            value_stack[branch_pos, :, :, :length] = value
-            mask[branch_pos, :length] = True
-        grouped_kv.append((key_stack, value_stack))
-        if grouped_mask is None:
-            grouped_mask = mask
-    if grouped_mask is None:
-        raise ValueError("grouped prompt cache has no transformer blocks")
-    return grouped_kv, grouped_mask
+    return steps
+
+
+def _append_branch_prompt_cache_to_sequential_steps(
+    steps: list[dict[str, Any]],
+    branch_cache: dict[str, Any],
+    *,
+    branch_position: int,
+    branch_index: int,
+    cache_len: int,
+    storage_dtype: torch.dtype | None,
+    target_device: torch.device | None,
+) -> None:
+    mask_device = target_device or branch_cache["steps"][0]["prompt_cache"]["kv"][0][0].device
+    prompt_mask = torch.ones((cache_len,), dtype=torch.bool, device=mask_device)
+    for step, branch_step in zip(steps, branch_cache["steps"]):
+        source_kv = branch_step["prompt_cache"]["kv"]
+        stored_kv = []
+        for kv_index, (key, value) in enumerate(source_kv):
+            stored_kv.append(
+                (
+                    optimize_tensor(key.detach(), storage_dtype, target_device),
+                    optimize_tensor(value.detach(), storage_dtype, target_device),
+                )
+            )
+            source_kv[kv_index] = (None, None)
+        branch_step["prompt_cache"]["kv"] = []
+        step["prompt_cache"]["sequential_branch_caches"].append(
+            {
+                "branch_position": int(branch_position),
+                "branch_index": int(branch_index),
+                "cache_len": int(cache_len),
+                "prompt_mask": prompt_mask,
+                "kv": stored_kv,
+            }
+    )
+
+
+def _attach_dominant_grouped_prompt_inputs(
+    steps: list[dict[str, Any]],
+    branch_cache: dict[str, Any],
+    *,
+    fused_embedding: torch.Tensor,
+    model: VCOnlyModel,
+    storage_dtype: torch.dtype | None,
+    target_device: torch.device | None,
+    attention_temperature: float,
+) -> None:
+    fused_spks = torch.nn.functional.normalize(fused_embedding, dim=1)
+    fused_spks = model.flow.spk_embed_affine_layer(fused_spks)
+    for step, dominant_step in zip(steps, branch_cache["steps"]):
+        prompt_inputs_for_step = dict(dominant_step["prompt_inputs"])
+        spks_in = torch.zeros_like(prompt_inputs_for_step["spks_in"])
+        spks_in[: fused_spks.shape[0]] = fused_spks
+        prompt_inputs_for_step["spks_in"] = spks_in
+        prompt_cache = step["prompt_cache"]
+        prompt_cache["input_embed_cache"] = optimize_tensor_tree(
+            dominant_step["prompt_cache"].get("input_embed_cache"),
+            storage_dtype,
+            target_device,
+        )
+        prompt_cache["attention_temperature"] = float(attention_temperature)
+        step["prompt_inputs"] = prompt_inputs_for_step
 
 
 def prepare_grouped_prompt_runtime_inputs(prompt_inputs: VoicePromptInputs) -> dict[str, Any]:
@@ -442,6 +532,10 @@ def optimize_prompt_cache_storage(
             prompt_cache["grouped_kv"] = optimize_kv_list(prompt_cache["grouped_kv"], storage_dtype, target_device)
         if offload_kv_to_cpu and "grouped_prompt_mask" in prompt_cache:
             prompt_cache["grouped_prompt_mask"] = prompt_cache["grouped_prompt_mask"].cpu()
+        for branch_cache in prompt_cache.get("sequential_branch_caches", []):
+            branch_cache["kv"] = optimize_kv_list(branch_cache["kv"], storage_dtype, target_device)
+            if offload_kv_to_cpu and "prompt_mask" in branch_cache:
+                branch_cache["prompt_mask"] = branch_cache["prompt_mask"].cpu()
         input_embed_cache = prompt_cache.get("input_embed_cache")
         if isinstance(input_embed_cache, dict):
             prompt_cache["input_embed_cache"] = optimize_tensor_tree(input_embed_cache, storage_dtype, target_device)
@@ -719,8 +813,7 @@ def prepare_stream_context(
         flow_streaming
         and not settings.disable_history_kv_cache
         and use_prompt_kv_cache
-        and not use_grouped_prompt_cache
-        and not use_grouped_prompt
+        and (not use_grouped_prompt or use_grouped_prompt_cache)
         and is_static_cache_aligned(history_tokens, model)
     )
     sync_device(model.device)
@@ -754,6 +847,9 @@ def prepare_stream_context(
             prompt_feat_len=prompt_feat_len,
             embedding=embedding,
             streaming=flow_streaming,
+            cache_storage_dtype=cache_storage_dtype,
+            cache_target_device=torch.device("cpu") if offload_prompt_kv else None,
+            keep_prompt_inputs=True,
         )
         optimize_prompt_cache_storage(
             prompt_cache_steps,
@@ -832,6 +928,11 @@ def stream_context_log_lines(
     ]
     if context.prompt_cache_disabled_reason:
         lines.append(f"prompt_cache_disabled_reason={context.prompt_cache_disabled_reason}")
+    if context.use_grouped_prompt_cache and isinstance(context.prompt_cache_steps, dict):
+        steps = context.prompt_cache_steps.get("steps") or []
+        if steps:
+            mode = steps[0].get("prompt_cache", {}).get("grouped_attention_mode", "vectorized")
+            lines.append(f"grouped_prompt_cache_mode={mode}")
     if context.voice_package_metadata is not None:
         metadata = context.voice_package_metadata
         runtime_policy = "dominant_branch_prompt_with_fused_embedding"
