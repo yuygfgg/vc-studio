@@ -980,9 +980,10 @@ def run_window_stream(
     stop_event: threading.Event | None = None,
     collect_chunks: bool = True,
 ) -> tuple[torch.Tensor, list[dict]]:
-    right_context_tokens = model.flow.pre_lookahead_len
     hop_samples = model.sample_rate // (25 * model.token_mel_ratio)
     hift_right_context_mel = hift_required_right_context_mel(model, hop_samples)
+    flow_right_context_tokens = model.flow.pre_lookahead_len
+    hift_right_context_tokens = math.ceil(hift_right_context_mel / model.token_mel_ratio)
     chunks = []
     rows = []
     stream_start = source_stream.started_at
@@ -1011,6 +1012,10 @@ def run_window_stream(
         ):
             break
         chunk_start_wall = time.perf_counter()
+        right_context_tokens = max(
+            flow_right_context_tokens,
+            hift_right_context_tokens - delayed_commit_tokens - overlap_tokens,
+        )
         target_end = start_token + chunk_tokens + delayed_commit_tokens + overlap_tokens + right_context_tokens
         token_wait_seconds = source_stream.wait_until(target_end)
         available_tokens = source_stream.token_count()
