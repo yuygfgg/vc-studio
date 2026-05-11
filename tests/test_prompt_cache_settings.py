@@ -8,13 +8,39 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from vc_studio_backend import (
-    choose_prompt_cache_budget_frames,
+from vc_studio_core.backend import (
+    StreamSettings,
     choose_full_prompt_cache_frames,
+    choose_prompt_cache_budget_frames,
     prompt_cache_offload_kv_to_cpu,
     prompt_cache_storage_dtype,
     realtime_output_sample_rate,
 )
+
+
+def test_stream_settings_is_constructible() -> None:
+    settings = StreamSettings(
+        chunk_sec=2.0,
+        tokenizer_chunk_sec=None,
+        tokenizer_left_context_sec=0.5,
+        tokenizer_right_context_sec=0.2,
+        history_sec=3.0,
+        mel_overlap_sec=0.25,
+        delayed_commit_sec=0.5,
+        audio_declick_ms=0.0,
+        audio_blend_ms=0.0,
+        vad_enabled=False,
+        vad_threshold=0.5,
+        vad_min_speech_ms=100.0,
+        vad_min_silence_ms=100.0,
+        vad_speech_pad_ms=30.0,
+        flow_context="streaming",
+        hift_mode="stateful",
+        disable_prompt_kv_cache=False,
+        disable_history_kv_cache=False,
+    )
+    assert settings.chunk_sec == 2.0
+    assert settings.prompt_runtime_policy == "auto"
 
 
 class _DummyModel:

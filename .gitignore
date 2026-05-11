@@ -36,6 +36,7 @@ data
 raw_wav
 tensorboard
 **/*build*
+!vc_studio_core/backend/voice_package_builder.py
 
 # Clangd files
 .cache

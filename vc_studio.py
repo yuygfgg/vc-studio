@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 
-from vc_studio_ui import launch_gui
+from vc_studio_core.ui import launch_gui
 
 
 def main() -> None:
