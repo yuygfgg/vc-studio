@@ -26,6 +26,11 @@ SAMPLE_RATE = 24000
 TOKEN_MEL_RATIO = 2
 SPEAKER_EMBEDDING_DIM = 192
 MEL_BINS = 80
+SOFT_PROMPT_ALGORITHM = "soft_prompt_v1"
+SOFT_PROMPT_VERSION = 1
+DEFAULT_SOFT_PROMPT_SECONDS = 15.0
+DEFAULT_SOFT_PROMPT_DISTILL_LAYER = 6
+DEFAULT_SOFT_PROMPT_CHECKPOINT_SEGMENTS = 3
 
 MODEL_HASH_FILES = {
     "flow_hash": "flow.pt",
@@ -100,6 +105,27 @@ REQUIRED_SOURCE_KEYS = {
     "is_masked",
 }
 
+SOFT_PROMPT_METADATA_KEYS = {
+    "soft_prompt_version",
+    "soft_prompt_mel_frames",
+    "soft_prompt_seconds",
+    "soft_prompt_init",
+    "soft_prompt_training_steps",
+    "soft_prompt_training_loss",
+    "soft_prompt_teacher",
+    "soft_prompt_distill_layer",
+    "soft_speaker_embedding_init",
+    "soft_speaker_embedding_trainable",
+    "soft_prompt_activation_checkpointing",
+    "soft_prompt_checkpoint_segments",
+}
+
+SOFT_PROMPT_TENSOR_KEYS = {
+    "soft_prompt_mu",
+    "soft_prompt_feat",
+    "soft_speaker_embedding",
+}
+
 
 class VoicePackageError(ValueError):
     pass
@@ -136,11 +162,28 @@ class VoicePromptBranch:
 
 
 @dataclass(frozen=True)
+class VoiceSoftPrompt:
+    prompt_mu: torch.Tensor
+    prompt_feat: torch.Tensor
+    speaker_embedding: torch.Tensor
+    metadata: dict[str, Any]
+
+    @property
+    def mel_frames(self) -> int:
+        return int(self.prompt_mu.shape[1])
+
+    @property
+    def seconds(self) -> float:
+        return self.mel_frames / float(TOKEN_RATE * TOKEN_MEL_RATIO)
+
+
+@dataclass(frozen=True)
 class VoicePromptInputs:
     branches: list[VoicePromptBranch]
     fused_embedding: torch.Tensor
     metadata: dict[str, Any]
     package_path: str | None = None
+    soft_prompt: VoiceSoftPrompt | None = None
 
     def active_branch_indices(self) -> list[int]:
         return [index for index, branch in enumerate(self.branches) if branch.weight_normalized > 0.0]
@@ -168,6 +211,9 @@ class VoicePromptInputs:
 
     def dominant_branch(self) -> VoicePromptBranch:
         return self.branches[self.dominant_branch_index()]
+
+    def has_soft_prompt(self) -> bool:
+        return self.soft_prompt is not None and self.metadata.get("prompt_fusion_algorithm") == SOFT_PROMPT_ALGORITHM
 
 
 def utc_now_iso() -> str:
@@ -364,11 +410,27 @@ def tensors_to_prompt_inputs(
     fused_embedding = torch.from_numpy(np.asarray(tensors["fused_speaker_embedding"], dtype=np.float32))
     if device is not None:
         fused_embedding = fused_embedding.to(device=device, dtype=torch.float32)
+    soft_prompt = None
+    if _metadata_declares_soft_prompt(metadata) or SOFT_PROMPT_TENSOR_KEYS <= set(tensors.keys()):
+        prompt_mu = torch.from_numpy(np.asarray(tensors["soft_prompt_mu"], dtype=np.float32))
+        prompt_feat = torch.from_numpy(np.asarray(tensors["soft_prompt_feat"], dtype=np.float32))
+        speaker_embedding = torch.from_numpy(np.asarray(tensors["soft_speaker_embedding"], dtype=np.float32))
+        if device is not None:
+            prompt_mu = prompt_mu.to(device=device, dtype=torch.float32)
+            prompt_feat = prompt_feat.to(device=device, dtype=torch.float32)
+            speaker_embedding = speaker_embedding.to(device=device, dtype=torch.float32)
+        soft_prompt = VoiceSoftPrompt(
+            prompt_mu=prompt_mu,
+            prompt_feat=prompt_feat,
+            speaker_embedding=speaker_embedding,
+            metadata={key: metadata.get(key) for key in SOFT_PROMPT_METADATA_KEYS if key in metadata},
+        )
     return VoicePromptInputs(
         branches=branches,
         fused_embedding=fused_embedding,
         metadata=dict(metadata),
         package_path=package_path,
+        soft_prompt=soft_prompt,
     )
 
 
@@ -412,6 +474,37 @@ def validate_metadata(metadata: Mapping[str, Any]) -> None:
         raise VoicePackageValidationError(
             f"prompt_sources must contain exactly one entry for each branch; got {sorted(branch_indices)}"
         )
+    if _metadata_declares_soft_prompt(metadata):
+        missing_soft = sorted(SOFT_PROMPT_METADATA_KEYS - set(metadata.keys()))
+        if missing_soft:
+            raise VoicePackageValidationError(
+                "malformed soft prompt package: missing metadata keys: " + ", ".join(missing_soft)
+            )
+        if int(metadata.get("soft_prompt_version")) != SOFT_PROMPT_VERSION:
+            raise VoicePackageValidationError(
+                f"unsupported soft_prompt_version: {metadata.get('soft_prompt_version')!r}"
+            )
+        _require_positive_int(metadata, "soft_prompt_mel_frames")
+        _require_positive_int(metadata, "soft_prompt_distill_layer")
+        _require_positive_int(metadata, "soft_prompt_checkpoint_segments")
+        try:
+            soft_prompt_training_steps = int(metadata.get("soft_prompt_training_steps", -1))
+        except (TypeError, ValueError) as error:
+            raise VoicePackageValidationError("soft_prompt_training_steps must be an integer") from error
+        if soft_prompt_training_steps < 0:
+            raise VoicePackageValidationError("soft_prompt_training_steps must be 0 or greater")
+        if float(metadata.get("soft_prompt_seconds", 0.0)) <= 0:
+            raise VoicePackageValidationError("soft_prompt_seconds must be greater than 0")
+        if metadata.get("soft_prompt_training_loss") != "layer_hidden_distill_v1":
+            raise VoicePackageValidationError("soft_prompt_training_loss must be layer_hidden_distill_v1")
+        if metadata.get("soft_prompt_teacher") != "grouped_branch_attention_hidden_state":
+            raise VoicePackageValidationError("soft_prompt_teacher must be grouped_branch_attention_hidden_state")
+        if metadata.get("soft_speaker_embedding_init") != "weighted_fused_embedding":
+            raise VoicePackageValidationError("soft_speaker_embedding_init must be weighted_fused_embedding")
+        if bool(metadata.get("soft_speaker_embedding_trainable")) is not False:
+            raise VoicePackageValidationError("soft_speaker_embedding_trainable must be false")
+        if metadata.get("soft_prompt_activation_checkpointing") not in {"off", "auto", "on"}:
+            raise VoicePackageValidationError("soft_prompt_activation_checkpointing must be off, auto, or on")
 
 
 def validate_tensors(
@@ -442,6 +535,18 @@ def validate_tensors(
     if missing:
         raise VoicePackageValidationError("malformed voice package: missing tensor keys: " + ", ".join(missing))
 
+    has_soft_tensors = bool(SOFT_PROMPT_TENSOR_KEYS & set(tensors.keys()))
+    if _metadata_declares_soft_prompt(metadata):
+        missing_soft = sorted(SOFT_PROMPT_TENSOR_KEYS - set(tensors.keys()))
+        if missing_soft:
+            raise VoicePackageValidationError(
+                "malformed soft prompt package: missing tensor keys: " + ", ".join(missing_soft)
+            )
+    elif has_soft_tensors:
+        raise VoicePackageValidationError(
+            "soft prompt tensors are present but prompt_fusion_algorithm is not soft_prompt_v1"
+        )
+
     fused = np.asarray(tensors["fused_speaker_embedding"])
     _require_shape_dtype(fused, "fused_speaker_embedding", (1, embedding_dim), np.float32)
     for index in range(branch_count):
@@ -462,6 +567,15 @@ def validate_tensors(
             raise VoicePackageValidationError(
                 f"branch_{index}_prompt_feat must have shape {expected_feat_shape}, got {feat.shape}"
             )
+
+    if _metadata_declares_soft_prompt(metadata):
+        soft_frames = int(metadata["soft_prompt_mel_frames"])
+        soft_mu = np.asarray(tensors["soft_prompt_mu"])
+        soft_feat = np.asarray(tensors["soft_prompt_feat"])
+        soft_speaker = np.asarray(tensors["soft_speaker_embedding"])
+        _require_shape_dtype(soft_mu, "soft_prompt_mu", (1, soft_frames, mel_bins), np.float32)
+        _require_shape_dtype(soft_feat, "soft_prompt_feat", (1, soft_frames, mel_bins), np.float32)
+        _require_shape_dtype(soft_speaker, "soft_speaker_embedding", (1, embedding_dim), np.float32)
 
 
 def branch_tensor_keys(branch_index: int) -> tuple[str, str, str]:
@@ -486,6 +600,10 @@ def sharpen_weights(weights: list[float], gamma: float) -> list[float]:
     if total <= 0:
         raise VoicePackageValidationError("at least one branch weight must be positive")
     return [value / total for value in sharpened]
+
+
+def _metadata_declares_soft_prompt(metadata: Mapping[str, Any]) -> bool:
+    return metadata.get("prompt_fusion_algorithm") == SOFT_PROMPT_ALGORITHM
 
 
 def _normalize_tensor_arrays(tensors: Mapping[str, np.ndarray | torch.Tensor]) -> dict[str, np.ndarray]:

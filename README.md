@@ -73,7 +73,8 @@ python3 vc_studio.py \
   --prompt-cache-max-mb 1024 \
   --prompt-cache-max-seconds 0 \
   --prompt-cache-dtype auto \
-  --prompt-cache-storage device
+  --prompt-cache-storage device \
+  --prompt-runtime-policy auto
 ```
 
 Command-line arguments only prefill GUI fields. See all available options with:
@@ -84,136 +85,382 @@ python3 vc_studio.py --help
 
 ## Near-Streaming CosyVoice Runtime
 
-VC Studio adapts CosyVoice3 voice conversion to a near-streaming runtime instead of
-waiting for a full source utterance. Source audio is converted into speech tokens at
-25 tokens per second by `AsyncSourceTokenizer` for files or `MicrophoneSourceTokenizer`
-for live input. Tokenization runs in its own thread and may use separate left and
-right tokenizer context, then crops the result back to the current chunk.
+VC Studio runs CosyVoice3 voice conversion as a bounded-window streaming
+approximation. Let the speech tokenizer emit source tokens at rate
+$r_{\mathrm{tok}} = 25$ tokens per second, and let $q$ denote the model
+token-to-mel expansion ratio. For chunk index $k$, define the committed token
+interval as
 
-`run_window_stream` consumes those tokens as soon as enough context is available.
-Each inference window contains left history, the current commit region, optional
-delayed-commit tokens, mel overlap, and the right context required by the flow
-pre-lookahead and HiFT vocoder. Only the current commit region is emitted, so
-latency is bounded mostly by `--chunk-sec` plus the configured lookahead rather
-than by the full input length.
+$$
+C_k = [s_k, s_k + n_c),
+$$
+
+where $n_c$ is derived from `--chunk-sec`. The flow inference window is extended
+with left history $n_h$, delayed-commit lookahead $n_d$, and tokenizer/right
+context $n_r$:
+
+$$
+W_k = [s_k - n_h,\ s_k + n_c + n_d + n_r).
+$$
+
+Only $C_k$ is emitted. The remaining context is used to stabilize token
+boundaries, flow attention, and HiFT synthesis, and is then discarded or retained
+only as cache state. The absolute source mel offset for the first emitted frame is
+
+$$
+o_k = q\,s_k.
+$$
+
+This offset is propagated into diffusion noise indexing, RoPE position indexing,
+and source-history cache construction. Consequently, each chunk is evaluated in a
+local computational window while preserving global source-time coordinates.
 
 ## Cache Hierarchy
 
-The repository uses several cache layers because CosyVoice3 spends time in
-different subsystems:
+The runtime separates immutable model state, package-level reference state, DiT
+attention state, and waveform synthesis state.
 
-- Model/session cache: `VCStudioBackend` keeps the loaded `VCOnlyModel` for the
-  active model directory, Torch device, ONNX Runtime provider, and CoreML cache
-  directory. ONNX Runtime sessions use graph optimizations; CoreML can persist its
-  compiled model under `--coreml-cache-dir`.
-- Voice package feature cache: `.cvvoice` packages store pre-extracted prompt
-  tokens, prompt mel features, speaker embeddings, source metadata, model hashes,
-  and fusion weights. This avoids repeating reference feature extraction on every
-  run.
-- Prompt KV cache: in streaming flow mode, `prepare_stream_context` can call
-  `model.flow.prepare_prompt_cache()` once for the target prompt. The cache stores
-  per-diffusion-step DiT prompt key/value tensors, input embedding convolution
-  tails, prompt inputs, and the final prompt diffusion state. Later chunks run only
-  the source side against that prepared prompt cache.
-- History KV cache: after a chunk finishes, the flow can keep a bounded KV cache
-  for the most recent source history and splice it onto the base prompt cache for
-  the next chunk. This avoids recomputing the left-history attention window when
-  the next window starts exactly at the previous chunk boundary.
-- Vocoder state cache: `--hift-mode stateful` carries HiFT F0 predictor state,
-  convolution tails, source excitation phase, sample offset, and ISTFT boundary
-  state across chunks. Window mode can also preserve harmonic source phase by
-  sample offset.
-- DSP/runtime caches: mel filter bases, Hann windows, Hugging Face files, Numba
-  artifacts, source token chunks, and realtime playback queues are kept outside
-  the core flow cache so repeated work is minimized.
+- Model/session cache: `VCStudioBackend` retains one loaded `VCOnlyModel` per
+  model directory, Torch device, ONNX Runtime provider, and CoreML cache
+  directory. ONNX Runtime sessions are reused with provider-specific graph
+  optimizations; CoreML may persist compiled artifacts under `--coreml-cache-dir`.
+- Voice package cache: `.cvvoice` stores reference tokens, prompt mel features,
+  speaker embeddings, branch weights, source metadata, model hashes, and optional
+  soft prompt tensors. This makes package loading independent of reference WAV
+  feature extraction.
+- Prompt KV cache: for a prepared prompt of length $T_p$, each diffusion step
+  stores DiT prompt key/value tensors and the input-embedding cache required to
+  continue the source side without recomputing the prompt prefix.
+- History KV cache: after a chunk has been synthesized, the most recent source
+  history of length $T_h$ can be represented as attention KV state and concatenated
+  with the base prompt cache for the next chunk.
+- Vocoder state cache: stateful HiFT carries predictor state, convolution tails,
+  harmonic source phase, sample offset, and ISTFT boundary state across chunks.
+- DSP/runtime caches: mel bases, analysis windows, source-token buffers, Numba
+  artifacts, downloaded model files, and playback queues are maintained outside
+  the DiT cache hierarchy.
 
-Prompt caches are quality-preserving: VC Studio only enables a prepared prompt KV
-cache when the full selected prompt fits the DiT static chunk grid
-(`static_chunk_size=50` mel frames) and the configured cache budget. If it does
-not fit, the runtime disables that cache and keeps the same prompt quality path
-without truncating the prompt. The budget estimates memory from branch count,
-diffusion steps, transformer layers, K/V tensors, CFG batch size, attention heads,
-frame count, and storage dtype. `--prompt-cache-max-mb`,
-`--prompt-cache-max-seconds`, `--prompt-cache-dtype`, and
-`--prompt-cache-storage` control whether the cache is allowed, how it is stored,
-and whether KV tensors stay on the device or are offloaded to CPU.
+Let $S$ be the number of diffusion steps, $L$ the number of DiT transformer
+blocks, $C$ the classifier-free-guidance batch factor, $H$ the number of attention
+heads, $d_h$ the per-head dimension, $b$ the number of bytes per stored scalar,
+and $T$ the cached prompt length in mel frames. A single-prompt KV cache has
+approximate storage
+
+$$
+M_{\mathrm{single}}
+\approx
+2SLCHTd_hb,
+$$
+
+where the factor $2$ accounts for keys and values. For grouped prompt attention
+with active branch lengths $\{T_i\}_{i=1}^{B}$, the corresponding upper bound is
+
+$$
+M_{\mathrm{grouped}}
+\approx
+2SLCHd_hb \sum_{i=1}^{B} T_i.
+$$
+
+For a soft prompt with configured length $T_s$,
+
+$$
+M_{\mathrm{soft}}
+\approx
+2SLCHT_s d_hb.
+$$
+
+Prompt-cache admission is quality preserving. A cache is prepared only when the
+complete selected prompt satisfies the static DiT cache grid and the configured
+memory policy. If the cache is not admissible, VC Studio disables that cache and
+executes the same conditioning path without truncating the prompt. The relevant
+controls are `--prompt-cache-max-mb`, `--prompt-cache-max-seconds`,
+`--prompt-cache-dtype`, and `--prompt-cache-storage`.
 
 ## Chunk Consistency
 
-Chunked inference can drift or click if each window is treated as an unrelated
-utterance. VC Studio uses several mechanisms to keep neighboring chunks coherent:
+The streaming approximation introduces two consistency constraints. First, a
+chunk must be evaluated at the same positional coordinates it would have occupied
+in a full-utterance run. Second, the waveform boundary between adjacent emitted
+chunks must be locally smooth.
 
-- Stable flow coordinates: diffusion noise is sliced by absolute source mel
-  offset, and cached source positions keep RoPE positions aligned to source time
-  even when a history cache is reused.
-- Explicit history and lookahead: each flow window includes left history plus the
-  right context required by flow pre-lookahead and HiFT. This gives the current
-  commit region enough context without emitting future frames.
-- Mel overlap blending: future mel frames from one chunk are saved and blended
-  into the start of the next chunk with a cosine crossfade.
-- Emitted-history anchoring: regenerated history mel can be replaced by the
-  already emitted mel tail, reducing feedback drift between windows.
-- Vocoder continuity: stateful HiFT keeps convolution, F0, source phase, and ISTFT
-  boundary state. Windowed HiFT uses absolute sample offsets and phase handoff to
-  keep harmonic excitation aligned.
-- Audio boundary repair: optional waveform crossfade and de-click correction can
-  smooth remaining sample-level discontinuities. Optional VAD gating applies
-  fades when muting nonspeech regions.
-- LavaSR bandwidth extension: enabled by default. Converted 24 kHz chunks are
-  lowpass/resampled to 16 kHz, passed through LavaSR, and emitted as 48 kHz audio.
-  Use `--lavasr-lowpass-hz` to choose the 16 kHz cutoff/merge point, or
-  `--disable-lavasr` to keep the original 24 kHz HiFT output.
+For flow diffusion, the random noise tensor is indexed by absolute source mel
+position:
 
-The main quality/latency knobs are `--history-sec`, `--mel-overlap-sec`,
-`--delayed-commit-sec`, `--audio-blend-ms`, `--audio-declick-ms`, and
-`--lavasr-lowpass-hz`. Larger context/repair values usually improve joins and
-stability, while smaller values reduce latency.
+$$
+\epsilon_k[j] = \epsilon[o_k + j],
+\qquad 0 \le j < |W_k|q.
+$$
+
+The same absolute offset determines RoPE positions for source frames:
+
+$$
+p_k[j] = o_k + j.
+$$
+
+When history KV is reused, these positions are reconstructed relative to the
+prompt and history prefix so that cached and newly computed states remain
+coordinate-compatible.
+
+For mel overlap, let $M$ be the overlap length, $u_j$ the saved tail from the
+previous chunk, and $v_j$ the regenerated head of the current chunk. VC Studio
+uses a cosine interpolation weight
+
+$$
+\alpha_j =
+\frac{1}{2}\left(1 - \cos\frac{\pi j}{M - 1}\right),
+\qquad 0 \le j < M,
+$$
+
+and emits
+
+$$
+\hat{v}_j = (1 - \alpha_j)u_j + \alpha_j v_j.
+$$
+
+Emitted-history anchoring can replace regenerated history frames with the
+previously emitted mel tail before the commit region is selected. This constrains
+the current window to the already audible trajectory and reduces autoregressive
+drift across chunk boundaries.
+
+HiFT continuity is handled by carrying a synthesis state $s_k$:
+
+$$
+s_{k+1} = F_{\mathrm{HiFT}}(s_k,\ \hat{y}_k),
+$$
+
+where $s_k$ contains F0 predictor state, convolution tails, excitation phase,
+sample offset, and ISTFT boundary state. Optional waveform de-clicking and
+crossfade operate after vocoder synthesis. Optional VAD gating applies a smooth
+amplitude envelope to nonspeech regions. LavaSR bandwidth extension is applied as
+a post-processor: the converted waveform is lowpass-filtered, resampled to the
+LavaSR input rate, enhanced, and emitted at the higher output sample rate.
 
 ## Multi-Prompt Timbre Fusion
 
-Voice packages can contain multiple prompt references for one target voice. During
-package creation, each accepted WAV becomes a branch with its own prompt tokens,
-prompt mel features, speaker embedding, source hash, duration, and weight metadata.
-Fusion weights can be equal, duration based, or manual. Positive raw weights are
-normalized, optionally sharpened by `branch_weight_gamma`, and stored with the
-package.
+Assume a voice package contains $B$ accepted references. Reference $i$ provides
+prompt tokens $z_i$, prompt mel features $y_i$, a speaker embedding $e_i$, and a
+nonnegative raw fusion weight $a_i$. Raw weights are normalized and optionally
+sharpened by `branch_weight_gamma` $\gamma$:
 
-Speaker embedding fusion is independent from prompt attention. Each branch
-embedding is L2-normalized, combined by the normalized weights, then L2-normalized
-again into `fused_speaker_embedding`. In the default runtime path, the dominant
-branch supplies prompt tokens and prompt mel features, while the fused embedding
-provides the target speaker condition.
+$$
+\pi_i =
+\frac{a_i}{\sum_{j=1}^{B} a_j},
+\qquad
+w_i =
+\frac{\pi_i^\gamma}{\sum_{j=1}^{B} \pi_j^\gamma}.
+$$
 
-For stronger multi-reference prompt behavior, `--enable-grouped-prompt` enables
-grouped branch attention. The DiT source path keeps references separate in
-attention space: branch prompt KV tensors are stacked with masks, branch weights,
-and `attention_temperature`, then attention outputs are mixed per branch instead
-of concatenating references into one long prompt.
+The package-level speaker embedding is computed independently from prompt
+attention:
 
-`--enable-grouped-prompt-cache` is a separate performance option. When it is on
-and the full active branch set fits the cache budget, VC Studio prepares grouped
-prompt KV once and reuses it. When it is off, or when the cache cannot fit, the
-runtime still uses grouped prompt attention and recomputes temporary prompt KV
-per diffusion step and transformer layer. This means automatic cache fallback can
-make inference slower, but it does not silently switch the quality path back to
-dominant-branch prompting or allocate the full reusable grouped cache.
+$$
+\bar{e}
+=
+\operatorname{normalize}
+\left(
+  \sum_{i=1}^{B} w_i\operatorname{normalize}(e_i)
+\right).
+$$
+
+This common representation supports three runtime conditioning policies.
+
+### Dominant Branch Mode
+
+Dominant mode selects a single prompt branch
+
+$$
+d = \operatorname*{arg\,max}_{i} w_i,
+$$
+
+with deterministic lowest-index tie breaking. Runtime conditioning uses
+$(z_d, y_d, \bar{e})$. This mode has the lowest prompt-attention cost, but the
+prompt token and prompt mel context are sampled from one reference only. Its
+conditioning operator can be summarized as
+
+$$
+\mathcal{C}_{\mathrm{dom}}
+=
+\left(z_d,\ y_d,\ \bar{e}\right).
+$$
+
+Thus additional references influence the speaker embedding but not the prompt
+sequence attended by the DiT source path.
+
+### Grouped Branch Attention Mode
+
+Grouped mode retains branch identity in attention space. For transformer layer
+$\ell$, each branch produces prompt key/value tensors
+$(K_{i,\ell}, V_{i,\ell})$. For a source query matrix $Q_\ell$, branch-local
+attention is evaluated as
+
+$$
+A_{i,\ell}
+=
+\operatorname{softmax}
+\left(
+  \frac{Q_\ell K_{i,\ell}^{\top}}{\sqrt{d_h}\,\tau}
+  + M_i
+\right)V_{i,\ell},
+$$
+
+where $M_i$ is the branch mask, $d_h$ is the attention head dimension, and
+$\tau$ is `attention_temperature`. The grouped prompt contribution is the
+weighted mixture
+
+$$
+A_{\ell}^{\mathrm{grouped}}
+=
+\sum_{i=1}^{B} w_i A_{i,\ell}.
+$$
+
+This avoids concatenating references into a single prompt and preserves
+per-branch masks and weights. Its runtime and cache cost are proportional to the
+total active prompt length $\sum_{i=1}^{B} T_i$. If a grouped KV cache is not
+admissible, VC Studio recomputes grouped prompt KV online while preserving the
+grouped conditioning operator.
+
+### Soft Prompt Mode
+
+Soft prompt mode adds a package-specific distillation step and stores the result
+as `soft_prompt_v1`. Soft prompt training is enabled by default in the GUI. The
+package stores:
+
+- `soft_prompt_mu`: the token-derived decoder conditioning after expansion to
+  mel-frame rate.
+- `soft_prompt_feat`: a fixed-length mel prompt condition.
+- `soft_speaker_embedding`: the normalized weighted speaker embedding.
+
+Let $R_T(\cdot)$ denote linear resampling to the configured soft prompt length
+$T$, measured in mel frames. The token path maps each reference token sequence to
+a mel-rate decoder conditioning sequence:
+
+$$
+m_i =
+\operatorname{repeat\_interleave}
+\left(
+  \operatorname{pre\_lookahead}
+  \left(
+    \operatorname{input\_embedding}(z_i)
+  \right),
+  q
+\right).
+$$
+
+The soft prompt initialization is
+
+$$
+\mu_0 = \sum_{i=1}^{B} w_i R_T(m_i),
+\qquad
+f_0 = \sum_{i=1}^{B} w_i R_T(y_i),
+\qquad
+e_0 = \bar{e}.
+$$
+
+Over-length references are compressed into the canonical interval, shorter
+references are expanded to the same support, and equal-length references are left
+unchanged. No single reference is selected as the sole prompt carrier.
+
+Distillation optimizes only an additive residual $\Delta_\mu$:
+
+$$
+\mu_{\mathrm{soft}} = \mu_0 + \Delta_\mu.
+$$
+
+All CosyVoice model parameters are frozen. The tensors $f_0$ and $e_0$ are also
+frozen in the current implementation. For a sampled source token window $x$, a
+sampled diffusion time $t$, and a distillation layer $\ell$, the teacher is
+grouped branch attention and the student is the fixed soft prompt path:
+
+$$
+h_T =
+H_{\ell}^{\mathrm{grouped}}
+\left(
+  x,\ t;\ \{m_i,\ y_i,\ e_i,\ w_i\}_{i=1}^{B}
+\right),
+$$
+
+$$
+h_S =
+H_{\ell}^{\mathrm{soft}}
+\left(
+  x,\ t;\ \mu_0 + \Delta_\mu,\ f_0,\ e_0
+\right).
+$$
+
+The optimization target is
+
+$$
+\min_{\Delta_\mu}
+\mathbb{E}_{x,t}
+\left[
+  \left\lVert h_S^{\mathrm{src}} - h_T^{\mathrm{src}} \right\rVert_2^2
+  + \lambda \left\lVert \Delta_\mu \right\rVert_2^2
+  + \beta \left\lVert D\Delta_\mu \right\rVert_2^2
+\right],
+$$
+
+where $D$ is the first-order finite-difference operator along the prompt-time
+axis. The superscript $\mathrm{src}$ denotes the source-window slice of the
+hidden state; the prompt prefix is not used as a reconstruction target. Training
+windows are sampled from the weighted reference set. Therefore, adding reference audio
+increases the empirical support of the speaker adaptation problem while the
+inference-time prompt length remains $T$.
+
+The resulting runtime complexities are
+
+$$
+\mathcal{O}_{\mathrm{dom}} = \mathcal{O}(T_d),
+\qquad
+\mathcal{O}_{\mathrm{grouped}} = \mathcal{O}\left(\sum_{i=1}^{B} T_i\right),
+\qquad
+\mathcal{O}_{\mathrm{soft}} = \mathcal{O}(T),
+$$
+
+where $T_d$ is the dominant-branch prompt length and $T_i$ are per-branch prompt
+lengths. Under the intended operating regime, `soft_prompt_v1` provides the most
+expressive target-speaker conditioning: it uses multi-reference evidence during
+offline optimization, avoids the prompt-length bottleneck of a single selected
+reference, and exposes a fixed-cost prompt during inference.
 
 ## Performance Tuning
 
-Start with `--flow-context streaming`, `--hift-mode stateful`, prompt KV cache on,
-and history KV cache on. Enable `--enable-grouped-prompt` when you want the
-multi-reference grouped attention quality path; add `--enable-grouped-prompt-cache`
-when you also want its cache and have enough memory. Use `--device cuda` when
-available, `--device mps` on Apple Silicon, or `--device cpu` for compatibility.
-`--ort-provider auto` selects CUDA, CoreML, or CPU for the speech tokenizer
-depending on the installed ONNX Runtime build.
+The default operating point is `--flow-context streaming`, `--hift-mode stateful`,
+prompt KV caching enabled, history KV caching enabled, and
+`--prompt-runtime-policy auto`. In this configuration, packages with
+`soft_prompt_v1` use the fixed-cost soft prompt path; legacy packages use the
+configured dominant or grouped fallback policy.
 
-For lower latency, reduce `--chunk-sec`, `--tokenizer-chunk-sec`, and lookahead
-settings. For smoother output, increase history, mel overlap, delayed commit, or
-audio repair settings. For lower memory use, reduce `--prompt-cache-max-mb`, set
-`--prompt-cache-max-seconds`, choose fp16/bf16 prompt cache storage where supported,
-or use `--prompt-cache-storage cpu_offload`; if the cache no longer fits, the
-runtime keeps quality and runs without that cache.
+Let $n_c$ be the committed token count, $n_d$ the delayed-commit token count,
+$n_r$ the right-context token count, and $r_{\mathrm{tok}}$ the tokenizer rate.
+Ignoring hardware queueing and model execution time, the algorithmic lookahead is
+approximately
+
+$$
+L_{\mathrm{lookahead}}
+\approx
+\frac{n_d + n_r}{r_{\mathrm{tok}}}.
+$$
+
+Reducing `--chunk-sec`, `--tokenizer-chunk-sec`, `--delayed-commit-sec`, and
+right-context settings decreases latency, but it also reduces the context
+available to the tokenizer, flow pre-lookahead, and vocoder. Increasing
+`--history-sec`, `--mel-overlap-sec`, `--delayed-commit-sec`,
+`--audio-blend-ms`, or `--audio-declick-ms` increases boundary stability at the
+cost of additional compute, memory, or latency.
+
+The prompt runtime policy controls the speaker-conditioning operator:
+
+- `auto`: select `soft_prompt_v1` when present; otherwise use the configured
+  legacy package behavior.
+- `soft`: require the distilled soft prompt tensors.
+- `grouped`: evaluate grouped branch attention.
+- `dominant`: evaluate the dominant branch with the fused speaker embedding.
+
+Prompt-cache memory is controlled by `--prompt-cache-max-mb`,
+`--prompt-cache-max-seconds`, `--prompt-cache-dtype`, and
+`--prompt-cache-storage`. Reducing the budget may disable a cache, but cache
+rejection does not alter the selected conditioning operator. It only changes
+whether the corresponding prompt state is precomputed or recomputed.
 
 ## Notes
 

@@ -2,14 +2,18 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import torch
+import torch.nn.functional as F
 from omegaconf import DictConfig
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cosyvoice.flow.DiT.dit import DiT
 from cosyvoice.flow.flow_matching import CausalConditionalCFM
+from cosyvoice.vc.soft_prompt import multi_reference_soft_prompt_initialization, prepare_branch_teacher_records
+from cosyvoice.vc.voice_package import VoicePromptBranch, VoicePromptInputs
 
 
 def test_uncached_grouped_prompt_flow_does_not_require_prepared_steps() -> None:
@@ -62,6 +66,142 @@ def test_prepare_prompt_cache_can_store_step_kv_in_half_without_prompt_inputs() 
     key, value = cache["steps"][0]["prompt_cache"]["kv"][0]
     assert key.dtype == torch.float16
     assert value.dtype == torch.float16
+
+
+def test_prepare_soft_prompt_cache_can_store_step_kv() -> None:
+    torch.manual_seed(13)
+    flow = _tiny_flow()
+
+    with torch.inference_mode():
+        cache_len, cache = flow.prepare_soft_prompt_cache(
+            soft_prompt_mu=torch.randn(1, 8, 80),
+            soft_prompt_feat=torch.randn(1, 8, 80),
+            soft_speaker_embedding=torch.randn(1, 192),
+            streaming=True,
+            cache_storage_dtype=torch.float16,
+            keep_prompt_inputs=False,
+        )
+
+    assert cache_len == 8
+    assert cache["soft_prompt"] is True
+    assert cache["steps"][0]["prompt_inputs"] is None
+    key, value = cache["steps"][0]["prompt_cache"]["kv"][0]
+    assert key.dtype == torch.float16
+    assert value.dtype == torch.float16
+
+
+def test_soft_prompt_hidden_forward_keeps_grad_on_prompt_mu() -> None:
+    torch.manual_seed(14)
+    estimator = _tiny_decoder().estimator
+    prompt_mu = torch.randn(1, 80, 8, requires_grad=True)
+    source_mu = torch.randn(1, 80, 6)
+
+    hidden = estimator.forward_soft_prompt_source_until_layer(
+        prompt_x=torch.randn(1, 80, 8),
+        prompt_mu=prompt_mu,
+        prompt_cond=torch.randn(1, 80, 8),
+        prompt_spks=torch.randn(1, 80),
+        source_x=torch.randn(1, 80, 6),
+        source_mu=source_mu,
+        t=torch.tensor(0.25),
+        source_spks=torch.randn(1, 80),
+        source_cond=torch.zeros_like(source_mu),
+        distill_layer=2,
+        streaming=True,
+        checkpoint_segments=2,
+    )
+    loss = hidden[:1].pow(2).mean()
+    loss.backward()
+
+    assert hidden.shape == (2, 6, 16)
+    assert prompt_mu.grad is not None
+    assert torch.isfinite(prompt_mu.grad).all()
+
+
+def test_soft_prompt_teacher_records_are_resampled_to_canonical_length() -> None:
+    torch.manual_seed(15)
+    model = _tiny_training_model()
+    first_feat = torch.arange(12 * 80, dtype=torch.float32).reshape(1, 12, 80)
+    prompt_inputs = VoicePromptInputs(
+        branches=[
+            VoicePromptBranch(
+                prompt_token=torch.tensor([[1, 2, 3, 4, 5, 6]], dtype=torch.int32),
+                prompt_feat=first_feat,
+                embedding=torch.randn(1, 192),
+                weight_raw=1.0,
+                weight_normalized=0.5,
+                metadata={"branch_index": 0},
+            ),
+            VoicePromptBranch(
+                prompt_token=torch.tensor([[2, 3, 4, 5, 6]], dtype=torch.int32),
+                prompt_feat=torch.randn(1, 10, 80),
+                embedding=torch.randn(1, 192),
+                weight_raw=1.0,
+                weight_normalized=0.5,
+                metadata={"branch_index": 1},
+            ),
+        ],
+        fused_embedding=torch.randn(1, 192),
+        metadata={"branch_weight_gamma": 1.0},
+    )
+
+    records = prepare_branch_teacher_records(
+        model,
+        prompt_inputs,
+        active_indices=[0, 1],
+        target_device=torch.device("cpu"),
+        target_frames=8,
+    )
+
+    assert len(records) == 2
+    assert records[0]["mu"].shape == (1, 80, 8)
+    assert records[0]["cond"].shape == (1, 80, 8)
+    expected = F.interpolate(first_feat.transpose(1, 2), size=8, mode="linear", align_corners=False).transpose(1, 2)
+    assert torch.allclose(records[0]["cond"].transpose(1, 2), expected)
+    assert records[1]["mu"].shape == (1, 80, 8)
+
+
+def test_soft_prompt_initialization_uses_weighted_resampled_references() -> None:
+    torch.manual_seed(16)
+    model = _tiny_training_model()
+    first_feat = torch.ones(1, 12, 80)
+    second_feat = torch.ones(1, 4, 80) * 3.0
+    prompt_inputs = VoicePromptInputs(
+        branches=[
+            VoicePromptBranch(
+                prompt_token=torch.tensor([[1, 2, 3, 4, 5, 6]], dtype=torch.int32),
+                prompt_feat=first_feat,
+                embedding=torch.randn(1, 192),
+                weight_raw=1.0,
+                weight_normalized=0.25,
+                metadata={"branch_index": 0},
+            ),
+            VoicePromptBranch(
+                prompt_token=torch.tensor([[2, 3]], dtype=torch.int32),
+                prompt_feat=second_feat,
+                embedding=torch.randn(1, 192),
+                weight_raw=3.0,
+                weight_normalized=0.75,
+                metadata={"branch_index": 1},
+            ),
+        ],
+        fused_embedding=torch.randn(1, 192),
+        metadata={"branch_weight_gamma": 1.0},
+    )
+
+    initial_mu, initial_feat = multi_reference_soft_prompt_initialization(
+        model,
+        prompt_inputs,
+        active_indices=[0, 1],
+        branch_weights=torch.tensor([0.25, 0.75]),
+        target_frames=8,
+    )
+
+    expected_first = F.interpolate(first_feat.transpose(1, 2), size=8, mode="linear", align_corners=False).transpose(1, 2)
+    expected_second = F.interpolate(second_feat.transpose(1, 2), size=8, mode="linear", align_corners=False).transpose(1, 2)
+    assert initial_mu.shape == (1, 8, 80)
+    assert initial_feat.shape == (1, 8, 80)
+    assert torch.allclose(initial_feat, expected_first * 0.25 + expected_second * 0.75)
 
 
 def test_streaming_prompt_cache_preserves_padding_mask() -> None:
@@ -381,3 +521,39 @@ def _tiny_decoder() -> CausalConditionalCFM:
         ),
         estimator=estimator,
     ).eval()
+
+
+def _tiny_flow():
+    from cosyvoice.flow.flow import CausalMaskedDiffWithDiT
+
+    decoder = _tiny_decoder()
+    return CausalMaskedDiffWithDiT(
+        input_size=16,
+        output_size=80,
+        spk_embed_dim=192,
+        vocab_size=32,
+        token_mel_ratio=2,
+        pre_lookahead_len=1,
+        pre_lookahead_layer=torch.nn.Conv1d(16, 16, kernel_size=1),
+        decoder=decoder,
+    ).eval()
+
+
+class _IdentityLookahead(torch.nn.Module):
+    def forward(self, x, context=None):
+        return x if context is None else torch.cat([x, context], dim=1)
+
+
+def _tiny_training_model():
+    flow = SimpleNamespace(
+        input_embedding=torch.nn.Embedding(32, 80),
+        pre_lookahead_layer=_IdentityLookahead(),
+        spk_embed_affine_layer=torch.nn.Linear(192, 80),
+        decoder=SimpleNamespace(estimator=SimpleNamespace(static_chunk_size=4)),
+        input_size=80,
+    )
+    return SimpleNamespace(
+        device=torch.device("cpu"),
+        token_mel_ratio=2,
+        flow=flow,
+    )

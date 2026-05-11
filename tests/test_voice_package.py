@@ -98,6 +98,51 @@ def test_sharpen_weights_masks_zero_weight_branch() -> None:
     assert weights[1] > weights[0]
 
 
+def test_soft_prompt_voice_package_round_trip(tmp_path: Path) -> None:
+    tensors = _sample_tensors(branch_count=2)
+    tensors["soft_prompt_mu"] = np.zeros((1, 50, MEL_BINS), dtype=np.float32)
+    tensors["soft_prompt_feat"] = np.ones((1, 50, MEL_BINS), dtype=np.float32)
+    tensors["soft_speaker_embedding"] = _unit_embedding(0)
+    metadata = _sample_metadata(
+        tmp_path,
+        branch_count=2,
+        prompt_fusion_algorithm="soft_prompt_v1",
+        soft_prompt_version=1,
+        soft_prompt_mel_frames=50,
+        soft_prompt_seconds=1.0,
+        soft_prompt_init="weighted_resampled_references",
+        soft_prompt_training_steps=0,
+        soft_prompt_training_loss="layer_hidden_distill_v1",
+        soft_prompt_teacher="grouped_branch_attention_hidden_state",
+        soft_prompt_distill_layer=6,
+        soft_speaker_embedding_init="weighted_fused_embedding",
+        soft_speaker_embedding_trainable=False,
+        soft_prompt_activation_checkpointing="auto",
+        soft_prompt_checkpoint_segments=3,
+    )
+    output = tmp_path / "soft.cvvoice"
+
+    save_voice_package(output, tensors, metadata)
+    loaded = load_voice_package(output, model=tmp_path / "model")
+
+    assert loaded.has_soft_prompt() is True
+    assert loaded.soft_prompt is not None
+    assert loaded.soft_prompt.prompt_mu.shape == (1, 50, MEL_BINS)
+    assert loaded.soft_prompt.prompt_feat.shape == (1, 50, MEL_BINS)
+    assert loaded.soft_prompt.speaker_embedding.shape == (1, SPEAKER_EMBEDDING_DIM)
+
+
+def test_soft_prompt_tensors_require_soft_prompt_algorithm(tmp_path: Path) -> None:
+    tensors = _sample_tensors(branch_count=1)
+    tensors["soft_prompt_mu"] = np.zeros((1, 50, MEL_BINS), dtype=np.float32)
+    tensors["soft_prompt_feat"] = np.ones((1, 50, MEL_BINS), dtype=np.float32)
+    tensors["soft_speaker_embedding"] = _unit_embedding(0)
+    metadata = _sample_metadata(tmp_path, branch_count=1)
+
+    with pytest.raises(VoicePackageValidationError, match="soft prompt tensors are present"):
+        save_voice_package(tmp_path / "bad.cvvoice", tensors, metadata)
+
+
 def _sample_tensors(branch_count: int) -> dict[str, np.ndarray]:
     tensors: dict[str, np.ndarray] = {}
     for index in range(branch_count):

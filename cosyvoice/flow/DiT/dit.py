@@ -13,6 +13,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from einops import repeat
 from x_transformers.x_transformers import RotaryEmbedding
 from cosyvoice.utils.mask import add_optional_chunk_mask
@@ -677,6 +678,296 @@ class DiT(nn.Module):
         source_output = self.proj_out(self.norm_out(source_hidden, source_t)).transpose(1, 2)
         assert source_output.shape[2] == source_len
         return prompt_outputs, source_output
+
+    def forward_soft_prompt_source_until_layer(
+        self,
+        prompt_x,
+        prompt_mu,
+        prompt_cond,
+        prompt_spks,
+        source_x,
+        source_mu,
+        t,
+        source_spks,
+        source_cond,
+        distill_layer=6,
+        streaming=False,
+        source_mel_offset=0,
+        checkpoint_segments=0,
+    ):
+        prompt_len = prompt_x.shape[2]
+        source_len = source_x.shape[2]
+        source_batch = source_x.size(0)
+        layer_count = min(max(int(distill_layer), 1), len(self.transformer_blocks))
+
+        x_prompt_in = torch.zeros([2 * source_batch, 80, prompt_len], device=prompt_x.device, dtype=source_spks.dtype)
+        prompt_mu_in = torch.zeros([2 * source_batch, 80, prompt_len], device=prompt_x.device, dtype=source_spks.dtype)
+        prompt_cond_in = torch.zeros([2 * source_batch, 80, prompt_len], device=prompt_x.device, dtype=source_spks.dtype)
+        prompt_mask_in = torch.ones([2 * source_batch, 1, prompt_len], device=prompt_x.device, dtype=torch.bool)
+        x_source_in = torch.zeros([2 * source_batch, 80, source_len], device=source_x.device, dtype=source_spks.dtype)
+        source_mu_in = torch.zeros([2 * source_batch, 80, source_len], device=source_x.device, dtype=source_spks.dtype)
+        source_cond_in = torch.zeros([2 * source_batch, 80, source_len], device=source_x.device, dtype=source_spks.dtype)
+        full_mask_in = torch.ones([2 * source_batch, 1, prompt_len + source_len], device=source_x.device, dtype=torch.bool)
+        t_in = torch.zeros([2 * source_batch], device=source_x.device, dtype=source_spks.dtype)
+        prompt_spks_in = torch.zeros([2 * source_batch, 80], device=prompt_x.device, dtype=source_spks.dtype)
+        source_spks_in = torch.zeros([2 * source_batch, 80], device=source_x.device, dtype=source_spks.dtype)
+
+        x_prompt_in[:] = prompt_x
+        prompt_mu_in[:source_batch] = prompt_mu
+        prompt_cond_in[:source_batch] = prompt_cond
+        x_source_in[:] = source_x
+        source_mu_in[:source_batch] = source_mu
+        source_cond_in[:source_batch] = source_cond
+        t_in[:] = t.reshape(1)
+        prompt_spks_in[:source_batch] = prompt_spks
+        source_spks_in[:source_batch] = source_spks
+
+        prompt_hidden, input_embed_cache = self.input_embed.forward_return_cache(
+            x_prompt_in.transpose(1, 2),
+            prompt_cond_in.transpose(1, 2),
+            prompt_mu_in.transpose(1, 2),
+            prompt_spks_in,
+        )
+        source_hidden, _ = self.input_embed.forward_with_cache(
+            x_source_in.transpose(1, 2),
+            source_cond_in.transpose(1, 2),
+            source_mu_in.transpose(1, 2),
+            source_spks_in,
+            cache=input_embed_cache,
+        )
+        t_emb = self.time_embed(t_in)
+        prompt_rope = self.rotary_embed.forward_from_seq_len(prompt_len)
+        source_position_base = int(prompt_len) + max(int(source_mel_offset), 0)
+        source_positions = torch.arange(source_len, device=source_hidden.device) + source_position_base
+        source_rope = self.rotary_embed(source_positions)
+        positions = self.cached_source_positions(
+            prompt_len + source_len,
+            prompt_len,
+            prompt_len,
+            source_mel_offset,
+            source_hidden.device,
+        )
+
+        if streaming is True:
+            if self.static_chunk_size > 0 and bool(prompt_mask_in.all().item()):
+                prompt_attn_mask = None
+                prompt_prefix_chunk_size = self.static_chunk_size
+            else:
+                prompt_attn_mask = add_optional_chunk_mask(
+                    prompt_hidden,
+                    prompt_mask_in.bool(),
+                    False,
+                    False,
+                    0,
+                    self.static_chunk_size,
+                    -1,
+                ).unsqueeze(dim=1)
+                prompt_prefix_chunk_size = None
+            source_attn_mask = self.global_chunk_mask(full_mask_in.bool(), positions)
+        else:
+            prompt_attn_mask = add_optional_chunk_mask(
+                prompt_hidden,
+                prompt_mask_in.bool(),
+                False,
+                False,
+                0,
+                0,
+                -1,
+            ).repeat(1, prompt_hidden.size(1), 1).unsqueeze(dim=1)
+            prompt_prefix_chunk_size = None
+            source_attn_mask = full_mask_in.bool().repeat(1, prompt_len + source_len, 1).unsqueeze(dim=1)
+        source_attn_mask = source_attn_mask[:, :, prompt_len:, :]
+        query_chunk_size = self.source_attention_query_chunk_size(source_len, prompt_len)
+
+        def run_layers(start, end, current_prompt_hidden, current_source_hidden):
+            for block in self.transformer_blocks[start:end]:
+                current_prompt_hidden, prompt_key, prompt_value = block.forward_return_kv(
+                    current_prompt_hidden,
+                    t_emb,
+                    mask=prompt_attn_mask.bool() if prompt_attn_mask is not None else None,
+                    rope=prompt_rope,
+                    prefix_chunk_size=prompt_prefix_chunk_size,
+                )
+                current_source_hidden = block.forward_with_prompt_kv(
+                    current_source_hidden,
+                    t_emb,
+                    prompt_key,
+                    prompt_value,
+                    mask=source_attn_mask.bool(),
+                    rope=source_rope,
+                    query_chunk_size=query_chunk_size,
+                )
+            return current_prompt_hidden, current_source_hidden
+
+        segments = max(0, int(checkpoint_segments or 0))
+        if segments > 0 and torch.is_grad_enabled():
+            segment_size = max(1, (layer_count + segments - 1) // segments)
+            start = 0
+            while start < layer_count:
+                end = min(layer_count, start + segment_size)
+                prompt_hidden, source_hidden = checkpoint(
+                    lambda prompt_arg, source_arg, layer_start=start, layer_end=end: run_layers(
+                        layer_start,
+                        layer_end,
+                        prompt_arg,
+                        source_arg,
+                    ),
+                    prompt_hidden,
+                    source_hidden,
+                    use_reentrant=False,
+                )
+                start = end
+        else:
+            prompt_hidden, source_hidden = run_layers(0, layer_count, prompt_hidden, source_hidden)
+
+        return source_hidden
+
+    def forward_grouped_prompt_source_until_layer(
+        self,
+        branch_prompt_x,
+        branch_prompt_mu,
+        branch_prompt_cond,
+        branch_spks,
+        source_x,
+        source_mu,
+        t,
+        source_spks,
+        source_cond,
+        branch_weights,
+        distill_layer=6,
+        dominant_branch_position=0,
+        streaming=False,
+        source_mel_offset=0,
+        attention_temperature=1.0,
+    ):
+        if not branch_prompt_x:
+            raise ValueError("grouped prompt inputs have no active branches")
+
+        source_len = source_x.shape[2]
+        branch_count = len(branch_prompt_x)
+        layer_count = min(max(int(distill_layer), 1), len(self.transformer_blocks))
+        branch_weights = branch_weights.to(device=source_x.device, dtype=source_x.dtype)
+        branch_hidden = []
+        branch_t = []
+        branch_masks = []
+        branch_ropes = []
+        branch_prompt_masks = []
+        branch_input_embed_caches = []
+
+        for prompt_x, prompt_mu, prompt_cond, prompt_spk in zip(
+            branch_prompt_x,
+            branch_prompt_mu,
+            branch_prompt_cond,
+            branch_spks,
+        ):
+            prompt_len = prompt_x.shape[2]
+            batch = prompt_x.size(0)
+            x_prompt_in = torch.zeros([2 * batch, 80, prompt_len], device=prompt_x.device, dtype=source_spks.dtype)
+            prompt_mu_in = torch.zeros([2 * batch, 80, prompt_len], device=prompt_x.device, dtype=source_spks.dtype)
+            prompt_cond_in = torch.zeros([2 * batch, 80, prompt_len], device=prompt_x.device, dtype=source_spks.dtype)
+            prompt_mask_in = torch.ones([2 * batch, 1, prompt_len], device=prompt_x.device, dtype=torch.bool)
+            t_in = torch.zeros([2 * batch], device=prompt_x.device, dtype=source_spks.dtype)
+            spks_in = torch.zeros([2 * batch, 80], device=prompt_x.device, dtype=source_spks.dtype)
+
+            x_prompt_in[:] = prompt_x
+            prompt_mu_in[:batch] = prompt_mu
+            prompt_cond_in[:batch] = prompt_cond
+            t_in[:] = t.reshape(1)
+            spks_in[:batch] = prompt_spk
+
+            hidden, input_embed_cache = self.input_embed.forward_return_cache(
+                x_prompt_in.transpose(1, 2),
+                prompt_cond_in.transpose(1, 2),
+                prompt_mu_in.transpose(1, 2),
+                spks_in,
+            )
+            t_emb = self.time_embed(t_in)
+            rope = self.rotary_embed.forward_from_seq_len(prompt_len)
+            if streaming is True:
+                attn_mask = add_optional_chunk_mask(
+                    hidden,
+                    prompt_mask_in.bool(),
+                    False,
+                    False,
+                    0,
+                    self.static_chunk_size,
+                    -1,
+                ).unsqueeze(dim=1)
+            else:
+                attn_mask = add_optional_chunk_mask(
+                    hidden,
+                    prompt_mask_in.bool(),
+                    False,
+                    False,
+                    0,
+                    0,
+                    -1,
+                ).repeat(1, hidden.size(1), 1).unsqueeze(dim=1)
+            branch_hidden.append(hidden)
+            branch_t.append(t_emb)
+            branch_masks.append(attn_mask.bool())
+            branch_ropes.append(rope)
+            branch_prompt_masks.append(torch.ones(prompt_len, dtype=torch.bool, device=prompt_x.device))
+            branch_input_embed_caches.append(input_embed_cache)
+
+        dominant_branch_position = max(0, min(int(dominant_branch_position), branch_count - 1))
+        prompt_len = branch_prompt_x[dominant_branch_position].shape[2]
+        source_batch = source_x.size(0)
+        x_source_in = torch.zeros([2 * source_batch, 80, source_len], device=source_x.device, dtype=source_spks.dtype)
+        source_mu_in = torch.zeros([2 * source_batch, 80, source_len], device=source_x.device, dtype=source_spks.dtype)
+        source_cond_in = torch.zeros([2 * source_batch, 80, source_len], device=source_x.device, dtype=source_spks.dtype)
+        full_mask_in = torch.ones([2 * source_batch, 1, prompt_len + source_len], device=source_x.device, dtype=torch.bool)
+        t_in = torch.zeros([2 * source_batch], device=source_x.device, dtype=source_spks.dtype)
+        spks_in = torch.zeros([2 * source_batch, 80], device=source_x.device, dtype=source_spks.dtype)
+        x_source_in[:] = source_x
+        source_mu_in[:source_batch] = source_mu
+        source_cond_in[:source_batch] = source_cond
+        t_in[:] = t.reshape(1)
+        spks_in[:source_batch] = source_spks
+        source_t = self.time_embed(t_in)
+        source_hidden, _ = self.input_embed.forward_with_cache(
+            x_source_in.transpose(1, 2),
+            source_cond_in.transpose(1, 2),
+            source_mu_in.transpose(1, 2),
+            spks_in,
+            cache=branch_input_embed_caches[dominant_branch_position],
+        )
+
+        source_position_base = int(prompt_len) + max(int(source_mel_offset), 0)
+        source_positions = torch.arange(source_len, device=source_hidden.device) + source_position_base
+        source_rope = self.rotary_embed(source_positions)
+        positions = self.cached_source_positions(prompt_len + source_len, prompt_len, prompt_len, source_mel_offset, source_hidden.device)
+        if streaming is True:
+            source_attn_mask = self.global_chunk_mask(full_mask_in.bool(), positions)
+        else:
+            source_attn_mask = full_mask_in.bool().repeat(1, prompt_len + source_len, 1).unsqueeze(dim=1)
+        source_attn_mask = source_attn_mask[:, :, prompt_len:, :]
+        query_chunk_size = self.source_attention_query_chunk_size(source_len, prompt_len)
+
+        for block in self.transformer_blocks[:layer_count]:
+            branch_kv = []
+            for branch_index in range(branch_count):
+                hidden, key, value = block.forward_return_kv(
+                    branch_hidden[branch_index],
+                    branch_t[branch_index],
+                    mask=branch_masks[branch_index],
+                    rope=branch_ropes[branch_index],
+                )
+                branch_hidden[branch_index] = hidden
+                branch_kv.append((key, value, branch_prompt_masks[branch_index]))
+            source_hidden = block.forward_with_sequential_grouped_prompt_kv(
+                source_hidden,
+                source_t,
+                branch_kv,
+                branch_weights,
+                mask=source_attn_mask.bool(),
+                rope=source_rope,
+                attention_temperature=attention_temperature,
+                query_chunk_size=query_chunk_size,
+            )
+            del branch_kv
+
+        return source_hidden
 
     def _stack_current_grouped_prompt_kv(self, keys, values):
         max_len = max(key.shape[2] for key in keys)

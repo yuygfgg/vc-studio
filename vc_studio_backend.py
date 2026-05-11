@@ -41,6 +41,7 @@ from cosyvoice.vc.voice_package import (
     TOKEN_MEL_RATIO,
     TOKEN_RATE,
     VoicePromptInputs,
+    VoicePromptBranch,
     l2_normalize_array,
     load_voice_package,
     model_compatibility_fields,
@@ -50,6 +51,7 @@ from cosyvoice.vc.voice_package import (
     sharpen_weights,
     utc_now_iso,
 )
+from cosyvoice.vc.soft_prompt import SoftPromptTrainingConfig, distill_soft_prompt_v1
 
 
 def prepare_prompt_inputs_from_wav(
@@ -84,6 +86,32 @@ def select_runtime_prompt_inputs(prompt_inputs: VoicePromptInputs) -> tuple[torc
     branch_index = prompt_inputs.dominant_branch_index()
     branch = prompt_inputs.branches[branch_index]
     return branch.prompt_token, branch.prompt_feat, prompt_inputs.fused_embedding, branch_index
+
+
+def select_soft_prompt_runtime_inputs(
+    prompt_inputs: VoicePromptInputs,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, dict[str, torch.Tensor]]:
+    if prompt_inputs.soft_prompt is None:
+        raise ValueError("voice package does not contain soft prompt tensors")
+    soft_prompt = prompt_inputs.soft_prompt
+    selected_branch_index = prompt_inputs.dominant_branch_index()
+    prompt_token = torch.empty(
+        (1, 0),
+        dtype=torch.int32,
+        device=soft_prompt.prompt_mu.device,
+    )
+    soft_prompt_inputs = {
+        "soft_prompt_mu": soft_prompt.prompt_mu,
+        "soft_prompt_feat": soft_prompt.prompt_feat,
+        "soft_speaker_embedding": soft_prompt.speaker_embedding,
+    }
+    return (
+        prompt_token,
+        soft_prompt.prompt_feat,
+        soft_prompt.speaker_embedding,
+        selected_branch_index,
+        soft_prompt_inputs,
+    )
 
 
 def prepare_grouped_prompt_cache(
@@ -355,6 +383,22 @@ def grouped_prompt_enabled(enabled: bool | None = None) -> bool:
     if enabled is not None:
         return bool(enabled)
     return os.environ.get("VC_STUDIO_ENABLE_GROUPED_PROMPT", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def normalize_prompt_runtime_policy(policy: str | None) -> str:
+    value = (policy or "auto").strip().lower()
+    aliases = {
+        "soft_prompt": "soft",
+        "soft_prompt_v1": "soft",
+        "grouped_prompt": "grouped",
+        "grouped_branch_attention": "grouped",
+        "dominant_branch": "dominant",
+        "dominant_branch_prompt": "dominant",
+    }
+    value = aliases.get(value, value)
+    if value not in {"auto", "soft", "grouped", "dominant"}:
+        raise ValueError("prompt runtime policy must be auto, soft, grouped, or dominant")
+    return value
 
 
 def prompt_cache_storage_dtype(model: VCOnlyModel, mode: str | None = None) -> torch.dtype | None:
@@ -641,6 +685,7 @@ class StreamSettings:
     prompt_cache_max_seconds: float = 0.0
     prompt_cache_dtype: str = "auto"
     prompt_cache_storage: str = "device"
+    prompt_runtime_policy: str = "auto"
     enable_grouped_prompt: bool = False
     enable_grouped_prompt_cache: bool = False
     lavasr_enabled: bool = True
@@ -687,6 +732,8 @@ class PreparedStreamContext:
     selected_branch_index: int | None = None
     prompt_cache_disabled_reason: str | None = None
     grouped_prompt_inputs: dict[str, Any] | None = None
+    soft_prompt_inputs: dict[str, torch.Tensor] | None = None
+    use_soft_prompt: bool = False
     use_grouped_prompt: bool = False
     use_grouped_prompt_cache: bool = False
 
@@ -706,26 +753,37 @@ def prepare_stream_context(
     flow_streaming = settings.flow_context == "streaming"
     prompt_cache_requested = flow_streaming and not settings.disable_prompt_kv_cache
     use_prompt_kv_cache = prompt_cache_requested
+    prompt_runtime_policy = normalize_prompt_runtime_policy(settings.prompt_runtime_policy)
 
     prompt_prepare_start = time.perf_counter()
     prompt_source_kind = "legacy_wav"
     voice_package_metadata = None
     selected_branch_index = None
     voice_inputs = None
+    soft_prompt_inputs = None
+    use_soft_prompt = False
     if isinstance(prompt_source, VoicePromptInputs):
         voice_inputs = prompt_source
-        prompt_token, prompt_feat, embedding, selected_branch_index = select_runtime_prompt_inputs(voice_inputs)
         voice_package_metadata = voice_inputs.metadata
         prompt_source_kind = "voice_package"
     else:
         prompt_path = Path(prompt_source).expanduser()
         if prompt_path.suffix.lower() == ".cvvoice":
             voice_inputs = prepare_prompt_inputs_from_package(model, prompt_path)
-            prompt_token, prompt_feat, embedding, selected_branch_index = select_runtime_prompt_inputs(voice_inputs)
             voice_package_metadata = voice_inputs.metadata
             prompt_source_kind = "voice_package"
         else:
             prompt_token, prompt_feat, embedding = prepare_prompt_inputs_from_wav(model, prompt_path)
+    if voice_inputs is not None:
+        use_soft_prompt = voice_inputs.has_soft_prompt() and prompt_runtime_policy in {"auto", "soft"}
+        if prompt_runtime_policy == "soft" and not voice_inputs.has_soft_prompt():
+            raise ValueError("prompt runtime policy soft requires a voice package with soft_prompt_v1")
+        if use_soft_prompt:
+            prompt_token, prompt_feat, embedding, selected_branch_index, soft_prompt_inputs = select_soft_prompt_runtime_inputs(
+                voice_inputs
+            )
+        else:
+            prompt_token, prompt_feat, embedding, selected_branch_index = select_runtime_prompt_inputs(voice_inputs)
     prompt_cache_disabled_reason = None
     prompt_cache_notes: list[str] = []
     cache_storage_dtype = prompt_cache_storage_dtype(model, settings.prompt_cache_dtype)
@@ -738,16 +796,26 @@ def prepare_stream_context(
     active_branch_count = len(voice_inputs.active_branch_indices()) if voice_inputs is not None else 1
     use_grouped_prompt = (
         voice_inputs is not None
+        and not use_soft_prompt
         and len(voice_inputs.branches) > 1
         and active_branch_count > 1
-        and grouped_prompt_enabled(settings.enable_grouped_prompt)
+        and (
+            prompt_runtime_policy == "grouped"
+            or (
+                prompt_runtime_policy == "auto"
+                and grouped_prompt_enabled(settings.enable_grouped_prompt)
+            )
+        )
     )
     grouped_prompt_inputs = prepare_grouped_prompt_runtime_inputs(voice_inputs) if use_grouped_prompt and voice_inputs is not None else None
     grouped_cache_mel_frames = None
     use_grouped_prompt_cache = (
         use_grouped_prompt
         and prompt_cache_requested
-        and grouped_prompt_cache_enabled(settings.enable_grouped_prompt_cache)
+        and (
+            prompt_runtime_policy == "grouped"
+            or grouped_prompt_cache_enabled(settings.enable_grouped_prompt_cache)
+        )
     )
 
     if use_grouped_prompt and prompt_cache_requested and not use_grouped_prompt_cache:
@@ -836,6 +904,24 @@ def prepare_stream_context(
         )
         sync_device(model.device)
         prompt_cache_prepare_seconds = time.perf_counter() - cache_start
+    elif use_prompt_kv_cache and use_soft_prompt and soft_prompt_inputs is not None:
+        cache_start = time.perf_counter()
+        prompt_cache_len, prompt_cache_steps = model.flow.prepare_soft_prompt_cache(
+            soft_prompt_mu=soft_prompt_inputs["soft_prompt_mu"],
+            soft_prompt_feat=soft_prompt_inputs["soft_prompt_feat"],
+            soft_speaker_embedding=soft_prompt_inputs["soft_speaker_embedding"],
+            streaming=flow_streaming,
+            cache_storage_dtype=cache_storage_dtype,
+            cache_target_device=torch.device("cpu") if offload_prompt_kv else None,
+            keep_prompt_inputs=True,
+        )
+        optimize_prompt_cache_storage(
+            prompt_cache_steps,
+            cache_storage_dtype,
+            offload_kv_to_cpu=offload_prompt_kv,
+        )
+        sync_device(model.device)
+        prompt_cache_prepare_seconds = time.perf_counter() - cache_start
     elif use_prompt_kv_cache:
         cache_start = time.perf_counter()
         prompt_token_len = torch.tensor([prompt_token.shape[1]], dtype=torch.int32, device=model.device)
@@ -882,6 +968,8 @@ def prepare_stream_context(
         selected_branch_index=selected_branch_index,
         prompt_cache_disabled_reason=prompt_cache_disabled_reason,
         grouped_prompt_inputs=grouped_prompt_inputs,
+        soft_prompt_inputs=soft_prompt_inputs,
+        use_soft_prompt=use_soft_prompt,
         use_grouped_prompt=use_grouped_prompt,
         use_grouped_prompt_cache=use_grouped_prompt_cache,
     )
@@ -902,6 +990,8 @@ def stream_context_log_lines(
         f"prompt_cache_max_seconds={settings.prompt_cache_max_seconds:g}",
         f"prompt_cache_dtype={settings.prompt_cache_dtype}",
         f"prompt_cache_storage={settings.prompt_cache_storage}",
+        f"prompt_runtime_policy={normalize_prompt_runtime_policy(settings.prompt_runtime_policy)}",
+        f"soft_prompt={context.use_soft_prompt}",
         f"grouped_prompt={context.use_grouped_prompt}",
         f"grouped_prompt_cache={context.use_grouped_prompt_cache}",
         f"history_kv_cache={context.use_history_kv_cache}",
@@ -942,6 +1032,10 @@ def stream_context_log_lines(
                 runtime_policy += "_cached"
             else:
                 runtime_policy += "_uncached"
+        elif context.use_soft_prompt:
+            runtime_policy = "soft_prompt_v1"
+            if context.use_prompt_kv_cache:
+                runtime_policy += "_cached"
         lines.extend(
             [
                 f"voice_package_id={metadata.get('package_id')}",
@@ -952,6 +1046,13 @@ def stream_context_log_lines(
                 f"voice_package_runtime_prompt_policy={runtime_policy}",
             ]
         )
+        if context.use_soft_prompt:
+            lines.extend(
+                [
+                    f"soft_prompt_seconds={float(metadata.get('soft_prompt_seconds', 0.0)):.3f}",
+                    f"soft_prompt_mel_frames={metadata.get('soft_prompt_mel_frames')}",
+                ]
+            )
     return lines
 
 
@@ -1893,6 +1994,7 @@ def run_window_stream(
     prompt_cache_len: int,
     prompt_cache_steps,
     grouped_prompt_inputs: dict[str, Any] | None = None,
+    soft_prompt_inputs: dict[str, torch.Tensor] | None = None,
     on_audio_chunk: Callable[[torch.Tensor, dict], None] | None = None,
     log_fn: Callable[[str], None] | None = print,
     stop_event: threading.Event | None = None,
@@ -1976,6 +2078,7 @@ def run_window_stream(
             prompt_cache_len=active_cache_len,
             prompt_cache_steps=active_cache_steps,
             grouped_prompt_inputs=grouped_prompt_inputs,
+            soft_prompt_inputs=soft_prompt_inputs,
             source_cache_len=source_cache_len,
             source_cache_end=source_cache_end,
             source_mel_offset=source_mel_offset,
@@ -2153,6 +2256,7 @@ def infer_flow_window(
     prompt_cache_len: int,
     prompt_cache_steps,
     grouped_prompt_inputs: dict[str, Any] | None,
+    soft_prompt_inputs: dict[str, torch.Tensor] | None,
     source_cache_len: int,
     source_cache_end: int,
     source_mel_offset: int,
@@ -2175,6 +2279,7 @@ def infer_flow_window(
             prompt_cache_len=prompt_cache_len,
             prompt_cache_steps=prompt_cache_steps,
             grouped_prompt_inputs=grouped_prompt_inputs,
+            soft_prompt_inputs=soft_prompt_inputs,
             source_cache_len=source_cache_len,
             source_cache_end=source_cache_end,
             source_mel_offset=source_mel_offset,
@@ -2410,6 +2515,12 @@ def create_voice_package(
     branch_weight_gamma = float(options_dict.get("branch_weight_gamma", 1.0))
     attention_temperature = float(options_dict.get("attention_temperature", 1.0))
     canonical_prompt_length_seconds = float(options_dict.get("canonical_prompt_length_seconds", 10.0))
+    enable_soft_prompt = bool(options_dict.get("enable_soft_prompt", False))
+    soft_prompt_seconds = float(options_dict.get("soft_prompt_seconds", 15.0))
+    soft_prompt_steps = int(options_dict.get("soft_prompt_steps", 300))
+    soft_prompt_teacher_mode = str(options_dict.get("soft_prompt_teacher_mode", "grouped_branch_attention"))
+    soft_prompt_activation_checkpointing = str(options_dict.get("soft_prompt_activation_checkpointing", "auto"))
+    soft_prompt_checkpoint_segments = int(options_dict.get("soft_prompt_checkpoint_segments", 3))
     skip_unreadable = bool(options_dict.get("skip_unreadable", False))
     if branch_weight_gamma <= 0:
         raise ValueError("branch_weight_gamma must be greater than 0")
@@ -2417,6 +2528,17 @@ def create_voice_package(
         raise ValueError("attention_temperature must be greater than 0")
     if canonical_prompt_length_seconds <= 0:
         raise ValueError("canonical_prompt_length_seconds must be greater than 0")
+    if enable_soft_prompt:
+        if soft_prompt_seconds <= 0:
+            raise ValueError("soft_prompt_seconds must be greater than 0")
+        if soft_prompt_steps < 0:
+            raise ValueError("soft_prompt_steps must be 0 or greater")
+        if soft_prompt_teacher_mode not in {"grouped_branch_attention", "init_only"}:
+            raise ValueError("soft_prompt_teacher_mode must be grouped_branch_attention or init_only")
+        if soft_prompt_activation_checkpointing not in {"off", "auto", "on"}:
+            raise ValueError("soft_prompt_activation_checkpointing must be off, auto, or on")
+        if soft_prompt_checkpoint_segments <= 0:
+            raise ValueError("soft_prompt_checkpoint_segments must be greater than 0")
 
     accepted: list[dict[str, Any]] = []
     total_reference_seconds = 0.0
@@ -2553,6 +2675,59 @@ def create_voice_package(
         if optional_key in options_dict:
             metadata[optional_key] = options_dict[optional_key]
 
+    if enable_soft_prompt:
+        soft_config = SoftPromptTrainingConfig(
+            enabled=True,
+            seconds=soft_prompt_seconds,
+            steps=soft_prompt_steps,
+            teacher_mode=soft_prompt_teacher_mode,
+            activation_checkpointing=soft_prompt_activation_checkpointing,
+            checkpoint_segments=soft_prompt_checkpoint_segments,
+            distill_layer=int(options_dict.get("soft_prompt_distill_layer", 6)),
+            source_window_min_mel_frames=int(options_dict.get("soft_prompt_source_window_min_mel_frames", 50)),
+            source_window_max_mel_frames=int(options_dict.get("soft_prompt_source_window_max_mel_frames", 100)),
+            learning_rate=float(options_dict.get("soft_prompt_learning_rate", 1e-2)),
+            hidden_mse_weight=float(options_dict.get("soft_prompt_hidden_mse_weight", 1.0)),
+            prompt_delta_l2_weight=float(options_dict.get("soft_prompt_delta_l2_weight", 1e-4)),
+            prompt_smoothness_weight=float(options_dict.get("soft_prompt_smoothness_weight", 1e-4)),
+            gradient_clip_norm=float(options_dict.get("soft_prompt_gradient_clip_norm", 1.0)),
+            validation_windows=int(options_dict.get("soft_prompt_validation_windows", 2)),
+            validation_every=int(options_dict.get("soft_prompt_validation_every", 50)),
+            low_memory_free_gb=float(options_dict.get("soft_prompt_low_memory_free_gb", 14.0)),
+            teacher_branch_subset_size=int(options_dict.get("soft_prompt_teacher_branch_subset_size", 0)),
+        )
+        voice_inputs = _voice_prompt_inputs_from_package_parts(
+            tensors=tensors,
+            metadata=metadata,
+            prompt_sources=prompt_sources,
+            fused_embedding=fused_embedding,
+            device=model.device,
+        )
+        log_fn(
+            "soft_prompt_requested=True "
+            f"seconds={soft_config.seconds:g} steps={soft_config.steps} "
+            f"teacher={soft_config.teacher_mode} checkpointing={soft_config.activation_checkpointing} "
+            f"segments={soft_config.checkpoint_segments}"
+        )
+        soft_result = distill_soft_prompt_v1(
+            model,
+            voice_inputs,
+            soft_config,
+            status_fn=status_fn,
+            log_fn=log_fn,
+        )
+        tensors.update(soft_result.tensors)
+        metadata.update(soft_result.metadata)
+        log_fn(
+            "soft_prompt_created=True "
+            f"mel_frames={metadata['soft_prompt_mel_frames']} "
+            f"seconds={metadata['soft_prompt_seconds']:.3f} "
+            f"steps={soft_result.training_steps} "
+            f"final_loss={soft_result.final_loss:.6f}"
+        )
+        sync_device(model.device)
+        empty_device_cache(model.device)
+
     status_fn("Saving voice package...")
     final_metadata = save_voice_package(
         output_path,
@@ -2649,6 +2824,45 @@ def _fuse_speaker_embeddings(normalized_embeddings: list[np.ndarray], weights: l
     return l2_normalize_array(fused).astype(np.float32)
 
 
+def _voice_prompt_inputs_from_package_parts(
+    *,
+    tensors: Mapping[str, np.ndarray],
+    metadata: Mapping[str, Any],
+    prompt_sources: list[dict[str, Any]],
+    fused_embedding: np.ndarray,
+    device: torch.device,
+) -> VoicePromptInputs:
+    branches = []
+    source_by_branch = {int(source["branch_index"]): source for source in prompt_sources}
+    branch_count = int(metadata["branch_count"])
+    for branch_index in range(branch_count):
+        source_metadata = source_by_branch[branch_index]
+        branches.append(
+            VoicePromptBranch(
+                prompt_token=torch.from_numpy(tensors[f"branch_{branch_index}_prompt_token"]).to(
+                    device=device,
+                    dtype=torch.int32,
+                ),
+                prompt_feat=torch.from_numpy(tensors[f"branch_{branch_index}_prompt_feat"]).to(
+                    device=device,
+                    dtype=torch.float32,
+                ),
+                embedding=torch.from_numpy(tensors[f"branch_{branch_index}_speaker_embedding"]).to(
+                    device=device,
+                    dtype=torch.float32,
+                ),
+                weight_raw=float(source_metadata["fusion_weight_raw"]),
+                weight_normalized=float(source_metadata["fusion_weight_normalized"]),
+                metadata=dict(source_metadata),
+            )
+        )
+    return VoicePromptInputs(
+        branches=branches,
+        fused_embedding=torch.from_numpy(fused_embedding).to(device=device, dtype=torch.float32),
+        metadata=dict(metadata),
+    )
+
+
 MappingLike = Mapping[str, Any]
 
 
@@ -2711,6 +2925,7 @@ class VCStudioBackend:
                 prompt_cache_len=context.prompt_cache_len,
                 prompt_cache_steps=context.prompt_cache_steps,
                 grouped_prompt_inputs=context.grouped_prompt_inputs,
+                soft_prompt_inputs=context.soft_prompt_inputs,
                 log_fn=log_fn,
                 stop_event=stop_event,
                 on_audio_chunk=lambda speech_chunk, row: metrics_fn(row, None),
@@ -2827,6 +3042,7 @@ class VCStudioBackend:
                 prompt_cache_len=context.prompt_cache_len,
                 prompt_cache_steps=context.prompt_cache_steps,
                 grouped_prompt_inputs=context.grouped_prompt_inputs,
+                soft_prompt_inputs=context.soft_prompt_inputs,
                 on_audio_chunk=handle_chunk,
                 log_fn=log_fn,
                 stop_event=stop_event,

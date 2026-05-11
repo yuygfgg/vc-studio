@@ -121,6 +121,7 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
                   use_prompt_cache=False,
                   prompt_cache_steps=None,
                   grouped_prompt_inputs=None,
+                  soft_prompt_inputs=None,
                   prompt_cache_len=0,
                   source_cache_len=0,
                   source_cache_end=0,
@@ -129,6 +130,22 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
         # xvec projection
         embedding = F.normalize(embedding, dim=1)
         embedding = self.spk_embed_affine_layer(embedding)
+
+        if soft_prompt_inputs is not None:
+            return self._inference_soft_prompt(
+                token=token,
+                token_len=token_len,
+                embedding=embedding,
+                streaming=streaming,
+                finalize=finalize,
+                soft_prompt_inputs=soft_prompt_inputs,
+                use_prompt_cache=use_prompt_cache,
+                prompt_cache_steps=prompt_cache_steps,
+                prompt_cache_len=prompt_cache_len,
+                source_cache_len=source_cache_len,
+                source_cache_end=source_cache_end,
+                source_mel_offset=source_mel_offset,
+            )
 
         base_prompt_mel_len = prompt_feat.shape[1]
         if grouped_prompt_inputs is not None and prompt_cache_steps is None:
@@ -232,6 +249,73 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
         )
         feat = feat[:, :, mel_len1:]
         assert feat.shape[2] == mel_len2
+        return feat.float(), updated_cache
+
+    def _inference_soft_prompt(
+            self,
+            token,
+            token_len,
+            embedding,
+            streaming,
+            finalize,
+            soft_prompt_inputs,
+            use_prompt_cache=False,
+            prompt_cache_steps=None,
+            prompt_cache_len=0,
+            source_cache_len=0,
+            source_cache_end=0,
+            source_mel_offset=0):
+        soft_prompt_mu = soft_prompt_inputs["soft_prompt_mu"].to(device=token.device)
+        soft_prompt_feat = soft_prompt_inputs["soft_prompt_feat"].to(device=token.device)
+        base_prompt_mel_len = soft_prompt_mu.shape[1]
+        if soft_prompt_feat.shape[1] != base_prompt_mel_len:
+            raise RuntimeError("soft_prompt_mu and soft_prompt_feat must have the same mel length")
+
+        decoder_prompt_len = prompt_cache_len if prompt_cache_steps is not None else base_prompt_mel_len
+        cached_history_mel = max(0, decoder_prompt_len - base_prompt_mel_len)
+        if cached_history_mel > 0 and cached_history_mel % self.token_mel_ratio == 0:
+            cached_history_tokens = cached_history_mel // self.token_mel_ratio
+            if token.shape[1] >= cached_history_tokens:
+                token = token[:, cached_history_tokens:]
+                token_len = torch.clamp(token_len - cached_history_tokens, min=0)
+
+        mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
+        token_embed = self.input_embedding(torch.clamp(token, min=0)) * mask
+        if finalize is True:
+            h = self.pre_lookahead_layer(token_embed)
+        else:
+            h = self.pre_lookahead_layer(
+                token_embed[:, :-self.pre_lookahead_len],
+                context=token_embed[:, -self.pre_lookahead_len:],
+            )
+        h = h.repeat_interleave(self.token_mel_ratio, dim=1)
+
+        total_mel_len = decoder_prompt_len + h.shape[1]
+        mu = torch.zeros([1, total_mel_len, self.output_size], device=token.device, dtype=h.dtype)
+        conds = torch.zeros([1, total_mel_len, self.output_size], device=token.device, dtype=h.dtype)
+        if prompt_cache_steps is None:
+            mu[:, :base_prompt_mel_len] = soft_prompt_mu.to(dtype=h.dtype)
+            conds[:, :base_prompt_mel_len] = soft_prompt_feat.to(dtype=h.dtype)
+        mu[:, decoder_prompt_len:] = h
+        conds = conds.transpose(1, 2)
+        full_mask = torch.ones([1, total_mel_len], device=token.device, dtype=torch.bool)
+
+        feat, updated_cache = self.decoder(
+            mu=mu.transpose(1, 2).contiguous(),
+            mask=full_mask.unsqueeze(1),
+            spks=embedding,
+            cond=conds,
+            n_timesteps=10,
+            streaming=streaming,
+            prompt_len=decoder_prompt_len,
+            use_prompt_cache=use_prompt_cache,
+            prompt_cache_steps=prompt_cache_steps,
+            source_cache_len=source_cache_len,
+            source_cache_end=source_cache_end,
+            source_mel_offset=source_mel_offset,
+        )
+        feat = feat[:, :, base_prompt_mel_len:]
+        assert feat.shape[2] == decoder_prompt_len - base_prompt_mel_len + h.shape[1]
         return feat.float(), updated_cache
 
     def _inference_grouped_prompt_uncached(
@@ -367,6 +451,46 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
         )
         cache_token_len = min(prompt_token.shape[1], cache_len // self.token_mel_ratio)
         cache["flow_token_tail"] = self._conditioning_tail_from_embedding(token[:, :cache_token_len])
+        return cache_len, cache
+
+    @torch.inference_mode()
+    def prepare_soft_prompt_cache(self,
+                                  soft_prompt_mu,
+                                  soft_prompt_feat,
+                                  soft_speaker_embedding,
+                                  streaming,
+                                  cache_storage_dtype=None,
+                                  cache_target_device=None,
+                                  keep_prompt_inputs=True):
+        assert soft_prompt_mu.shape[0] == 1
+        if soft_prompt_mu.shape != soft_prompt_feat.shape:
+            raise ValueError(
+                f"soft_prompt_mu and soft_prompt_feat must have the same shape, got "
+                f"{tuple(soft_prompt_mu.shape)} and {tuple(soft_prompt_feat.shape)}"
+            )
+        embedding = F.normalize(soft_speaker_embedding, dim=1)
+        embedding = self.spk_embed_affine_layer(embedding)
+
+        static_chunk_size = self.decoder.estimator.static_chunk_size
+        cache_len = int(soft_prompt_mu.shape[1] // static_chunk_size * static_chunk_size) if static_chunk_size > 0 else int(soft_prompt_mu.shape[1])
+        if cache_len <= 0:
+            return 0, None
+
+        mu = soft_prompt_mu[:, :cache_len].transpose(1, 2).contiguous()
+        cond = soft_prompt_feat[:, :cache_len].transpose(1, 2).contiguous()
+        mask = (~make_pad_mask(torch.tensor([cache_len], device=soft_prompt_mu.device))).to(soft_prompt_mu)
+        cache = self.decoder.prepare_prompt_cache(
+            mu=mu,
+            mask=mask.unsqueeze(1),
+            n_timesteps=10,
+            spks=embedding,
+            cond=cond,
+            streaming=streaming,
+            cache_storage_dtype=cache_storage_dtype,
+            cache_target_device=cache_target_device,
+            keep_prompt_inputs=keep_prompt_inputs,
+        )
+        cache["soft_prompt"] = True
         return cache_len, cache
 
     def _source_conditioning_from_tail(

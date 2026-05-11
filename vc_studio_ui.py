@@ -459,6 +459,13 @@ class VCStudioApp(QtWidgets.QMainWindow):
         self.device_var = TextValue(args.device)
         self.ort_provider_var = TextValue(args.ort_provider)
         self.coreml_cache_var = TextValue(args.coreml_cache_dir)
+        if getattr(args, "prompt_runtime_policy", "auto") != "auto":
+            prompt_runtime_policy = args.prompt_runtime_policy
+        elif getattr(args, 'enable_grouped_prompt', False) or getattr(args, 'enable_grouped_prompt_cache', False):
+            prompt_runtime_policy = "grouped"
+        else:
+            prompt_runtime_policy = "auto"
+        self.prompt_runtime_policy_var = TextValue(prompt_runtime_policy)
         self.chunk_sec_var = TextValue(f"{args.chunk_sec:g}")
         self.tokenizer_chunk_sec_var = TextValue(f"{args.tokenizer_chunk_sec:g}")
         self.tokenizer_left_context_sec_var = TextValue(f"{args.tokenizer_left_context_sec:g}")
@@ -483,10 +490,6 @@ class VCStudioApp(QtWidgets.QMainWindow):
         self.prompt_cache_max_seconds_var = TextValue(f"{getattr(args, 'prompt_cache_max_seconds', 0.0):g}")
         self.prompt_cache_dtype_var = TextValue(getattr(args, 'prompt_cache_dtype', "auto"))
         self.prompt_cache_storage_var = TextValue(getattr(args, 'prompt_cache_storage', "device"))
-        self.grouped_prompt_var = BoolValue(
-            getattr(args, 'enable_grouped_prompt', False) or getattr(args, 'enable_grouped_prompt_cache', False)
-        )
-        self.grouped_prompt_cache_var = BoolValue(getattr(args, 'enable_grouped_prompt_cache', False))
         self.input_device_var = TextValue("Default")
         self.output_device_var = TextValue("Default")
         self.status_var = TextValue("Ready")
@@ -503,6 +506,14 @@ class VCStudioApp(QtWidgets.QMainWindow):
         self.package_branch_gamma_var = TextValue("1.0")
         self.package_attention_temperature_var = TextValue("1.0")
         self.package_canonical_seconds_var = TextValue("10.0")
+        self.package_soft_prompt_var = BoolValue(getattr(args, "enable_soft_prompt", True))
+        self.package_soft_prompt_seconds_var = TextValue(f"{getattr(args, 'soft_prompt_seconds', 15.0):g}")
+        self.package_soft_prompt_steps_var = TextValue(f"{getattr(args, 'soft_prompt_steps', 300):g}")
+        self.package_soft_prompt_teacher_var = TextValue(getattr(args, "soft_prompt_teacher_mode", "grouped_branch_attention"))
+        self.package_soft_prompt_checkpointing_var = TextValue(
+            getattr(args, "soft_prompt_activation_checkpointing", "auto")
+        )
+        self.package_soft_prompt_segments_var = TextValue(f"{getattr(args, 'soft_prompt_checkpoint_segments', 3):g}")
 
     def _configure_style(self) -> None:
         self.qt_app.setFont(QtGui.QFont("Nunito", 11))
@@ -512,7 +523,7 @@ class VCStudioApp(QtWidgets.QMainWindow):
                 color: {self.colors["text"]};
                 font-family: "Nunito", "Quicksand", "Varela Round", "Comic Sans MS", "Avenir Next Rounded", "Helvetica Neue", Arial;
                 font-size: 13px;
-                letter-spacing: 0.5px;
+                letter-spacing: 0px;
             }}
             QMainWindow#MainWindow {{
                 background: {self.colors["bg"]};
@@ -850,6 +861,7 @@ class VCStudioApp(QtWidgets.QMainWindow):
         row = 0
         row = self._path_row(form, row, "Model dir", self.model_dir_var, "directory")
         row = self._path_row(form, row, "Voice package", self.voice_package_var, "open_cvvoice")
+        row = self._combo_row(form, row, "Prompt mode", self.prompt_runtime_policy_var, ["auto", "soft", "grouped", "dominant"])
         row = self._combo_row(form, row, "Torch device", self.device_var, ["auto", "cpu", "cuda", "mps"])
         row = self._combo_row(form, row, "ORT provider", self.ort_provider_var, ["auto", "cpu", "cuda", "coreml"])
         self._path_row(form, row, "CoreML cache", self.coreml_cache_var, "directory")
@@ -937,6 +949,44 @@ class VCStudioApp(QtWidgets.QMainWindow):
             "Canonical sec",
             self.package_canonical_seconds_var,
             "Stable source position base used by package metadata.",
+        )
+        self._checkbox_row(
+            form,
+            "Soft prompt",
+            self.package_soft_prompt_var,
+            "Distills all references into one fixed-length continuous prompt for constant-cost package runtime.",
+        )
+        self._number_row(
+            form,
+            "Soft prompt sec",
+            self.package_soft_prompt_seconds_var,
+            "Target soft prompt length. The value is converted to mel frames and aligned for prompt caching.",
+        )
+        self._number_row(
+            form,
+            "Soft prompt steps",
+            self.package_soft_prompt_steps_var,
+            "Offline optimization steps. 200 to 500 is the intended first budget; 0 stores initialization only.",
+        )
+        self._combo_form_row(
+            form,
+            "Soft teacher",
+            self.package_soft_prompt_teacher_var,
+            ["grouped_branch_attention", "init_only"],
+            "Teacher for offline distillation. init_only skips training and stores the weighted reference initialization.",
+        )
+        self._combo_form_row(
+            form,
+            "Soft checkpoint",
+            self.package_soft_prompt_checkpointing_var,
+            ["auto", "on", "off"],
+            "Activation checkpointing policy for soft prompt training only.",
+        )
+        self._number_row(
+            form,
+            "Soft segments",
+            self.package_soft_prompt_segments_var,
+            "Checkpoint segments across the distillation layers when checkpointing is enabled.",
         )
         self._path_form_row(
             form,
@@ -1274,20 +1324,6 @@ class VCStudioApp(QtWidgets.QMainWindow):
             self.prompt_cache_max_seconds_var,
             "Maximum full prompt duration allowed in the KV cache. If the prompt is longer, cache is disabled "
             "and quality is preserved. Set 0 to follow the memory budget.",
-        )
-        self._checkbox_row(
-            quality_form,
-            "Grouped prompt",
-            self.grouped_prompt_var,
-            "For multi-reference packages, use grouped branch attention for prompt fusion. This can change "
-            "voice quality and timbre; if cache is unavailable, the same quality path is recomputed per window.",
-        )
-        self._checkbox_row(
-            quality_form,
-            "Grouped prompt cache",
-            self.grouped_prompt_cache_var,
-            "Caches all active grouped prompt branches when Grouped prompt is enabled. This is a performance "
-            "option only; if it cannot fit, grouped prompt remains enabled without cache.",
         )
         quality_layout.addLayout(quality_form)
 
@@ -1929,12 +1965,27 @@ class VCStudioApp(QtWidgets.QMainWindow):
         branch_gamma = self._positive_float(self.package_branch_gamma_var, "Branch gamma")
         attention_temperature = self._positive_float(self.package_attention_temperature_var, "Attention temp")
         canonical_seconds = self._positive_float(self.package_canonical_seconds_var, "Canonical sec")
+        soft_prompt_seconds = self._positive_float(self.package_soft_prompt_seconds_var, "Soft prompt sec")
+        soft_prompt_steps = int(self._nonnegative_float(self.package_soft_prompt_steps_var, "Soft prompt steps"))
+        soft_prompt_teacher = self.package_soft_prompt_teacher_var.get()
+        if soft_prompt_teacher not in {"grouped_branch_attention", "init_only"}:
+            raise ValueError("Soft teacher must be grouped_branch_attention or init_only.")
+        soft_checkpointing = self.package_soft_prompt_checkpointing_var.get()
+        if soft_checkpointing not in {"auto", "on", "off"}:
+            raise ValueError("Soft checkpoint must be auto, on, or off.")
+        soft_segments = int(self._positive_float(self.package_soft_prompt_segments_var, "Soft segments"))
         options = {
             "fusion_mode": self.package_fusion_mode_var.get(),
             "manual_weights": manual_weights,
             "branch_weight_gamma": branch_gamma,
             "attention_temperature": attention_temperature,
             "canonical_prompt_length_seconds": canonical_seconds,
+            "enable_soft_prompt": self.package_soft_prompt_var.get(),
+            "soft_prompt_seconds": soft_prompt_seconds,
+            "soft_prompt_steps": soft_prompt_steps,
+            "soft_prompt_teacher_mode": soft_prompt_teacher,
+            "soft_prompt_activation_checkpointing": soft_checkpointing,
+            "soft_prompt_checkpoint_segments": soft_segments,
             "display_name": self.package_display_name_var.get().strip(),
             "short_description": self.package_short_description_var.get().strip(),
             "long_description": self.package_long_description_edit.toPlainText(),
@@ -1984,6 +2035,18 @@ class VCStudioApp(QtWidgets.QMainWindow):
             f"canonical_prompt_length_seconds: {metadata.get('canonical_prompt_length_seconds')}",
             f"tensor_sha256: {metadata.get('tensor_sha256')}",
         ]
+        if metadata.get("prompt_fusion_algorithm") == "soft_prompt_v1":
+            lines.extend(
+                [
+                    f"soft_prompt_version: {metadata.get('soft_prompt_version')}",
+                    f"soft_prompt_seconds: {float(metadata.get('soft_prompt_seconds', 0.0)):.3f}",
+                    f"soft_prompt_mel_frames: {metadata.get('soft_prompt_mel_frames')}",
+                    f"soft_prompt_training_steps: {metadata.get('soft_prompt_training_steps')}",
+                    f"soft_prompt_final_loss: {metadata.get('soft_prompt_final_loss')}",
+                    f"soft_prompt_activation_checkpointing: {metadata.get('soft_prompt_activation_checkpointing')}",
+                    f"soft_prompt_checkpoint_segments: {metadata.get('soft_prompt_checkpoint_segments')}",
+                ]
+            )
         if metadata.get("portrait_path"):
             lines.extend(
                 [
@@ -2159,6 +2222,9 @@ class VCStudioApp(QtWidgets.QMainWindow):
         prompt_cache_storage = self.prompt_cache_storage_var.get()
         if prompt_cache_storage not in {"device", "cpu_offload"}:
             raise ValueError("Prompt cache storage must be device or cpu_offload.")
+        prompt_runtime_policy = self.prompt_runtime_policy_var.get()
+        if prompt_runtime_policy not in {"auto", "soft", "grouped", "dominant"}:
+            raise ValueError("Prompt mode must be auto, soft, grouped, or dominant.")
         return StreamSettings(
             chunk_sec=chunk_sec,
             tokenizer_chunk_sec=tokenizer_chunk_sec if tokenizer_chunk_sec > 0 else None,
@@ -2182,8 +2248,9 @@ class VCStudioApp(QtWidgets.QMainWindow):
             prompt_cache_max_seconds=prompt_cache_max_seconds,
             prompt_cache_dtype=prompt_cache_dtype,
             prompt_cache_storage=prompt_cache_storage,
-            enable_grouped_prompt=self.grouped_prompt_var.get(),
-            enable_grouped_prompt_cache=self.grouped_prompt_var.get() and self.grouped_prompt_cache_var.get(),
+            prompt_runtime_policy=prompt_runtime_policy,
+            enable_grouped_prompt=prompt_runtime_policy == "grouped",
+            enable_grouped_prompt_cache=prompt_runtime_policy == "grouped",
             lavasr_enabled=lavasr_enabled,
             lavasr_lowpass_hz=lavasr_lowpass_hz,
         )

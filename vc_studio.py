@@ -56,11 +56,51 @@ def main() -> None:
         choices=["device", "cpu_offload"],
         help="Prefill prompt KV cache storage location",
     )
+    parser.add_argument(
+        "--prompt-runtime-policy",
+        default="auto",
+        choices=["auto", "soft", "grouped", "dominant"],
+        help="Prefill voice package prompt runtime mode",
+    )
     parser.add_argument("--enable-grouped-prompt", action="store_true", help="Prefill multi-branch grouped prompt fusion on")
     parser.add_argument(
         "--enable-grouped-prompt-cache",
         action="store_true",
         help="Prefill multi-branch grouped prompt KV cache on",
+    )
+    soft_prompt_group = parser.add_mutually_exclusive_group()
+    soft_prompt_group.add_argument(
+        "--enable-soft-prompt",
+        dest="enable_soft_prompt",
+        action="store_true",
+        default=True,
+        help="Prefill soft prompt package creation on",
+    )
+    soft_prompt_group.add_argument(
+        "--disable-soft-prompt",
+        dest="enable_soft_prompt",
+        action="store_false",
+        help="Prefill soft prompt package creation off",
+    )
+    parser.add_argument("--soft-prompt-seconds", type=float, default=15.0, help="Prefill soft prompt target seconds")
+    parser.add_argument("--soft-prompt-steps", type=int, default=300, help="Prefill soft prompt distillation steps")
+    parser.add_argument(
+        "--soft-prompt-teacher-mode",
+        default="grouped_branch_attention",
+        choices=["grouped_branch_attention", "init_only"],
+        help="Prefill soft prompt teacher mode",
+    )
+    parser.add_argument(
+        "--soft-prompt-activation-checkpointing",
+        default="auto",
+        choices=["auto", "on", "off"],
+        help="Prefill soft prompt training checkpoint policy",
+    )
+    parser.add_argument(
+        "--soft-prompt-checkpoint-segments",
+        type=int,
+        default=3,
+        help="Prefill soft prompt checkpoint segment count",
     )
     args = parser.parse_args()
     launch_gui(args)
