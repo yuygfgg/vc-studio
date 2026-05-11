@@ -180,24 +180,18 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
                     prompt_cache_steps["flow_token_tail"],
                     finalize=finalize,
                 )
-                total_mel_len = decoder_prompt_len + h.shape[1]
-                mu = torch.zeros([1, total_mel_len, self.output_size], device=token.device, dtype=h.dtype)
-                mu[:, decoder_prompt_len:] = h
-                conds = torch.zeros(
-                    [1, total_mel_len, self.output_size],
+                source_mu = h.transpose(1, 2).contiguous()
+                source_cond = torch.zeros(
+                    [1, self.output_size, h.shape[1]],
                     device=token.device,
                     dtype=h.dtype,
-                ).transpose(1, 2)
-                mask = torch.ones([1, total_mel_len], device=token.device, dtype=torch.bool)
-                feat, updated_cache = self.decoder(
-                    mu=mu.transpose(1, 2).contiguous(),
-                    mask=mask.unsqueeze(1),
-                    spks=embedding,
-                    cond=conds,
+                )
+                feat, updated_cache = self.decoder.forward_prepared_prompt_cache_source(
+                    source_mu=source_mu,
+                    source_cond=source_cond,
                     n_timesteps=10,
+                    spks=embedding,
                     streaming=streaming,
-                    prompt_len=decoder_prompt_len,
-                    use_prompt_cache=use_prompt_cache,
                     prompt_cache_steps=prompt_cache_steps,
                     source_cache_len=source_cache_len,
                     source_cache_end=source_cache_end,
@@ -289,6 +283,28 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
                 context=token_embed[:, -self.pre_lookahead_len:],
             )
         h = h.repeat_interleave(self.token_mel_ratio, dim=1)
+
+        if prompt_cache_steps is not None:
+            source_mu = h.transpose(1, 2).contiguous()
+            source_cond = torch.zeros(
+                [1, self.output_size, h.shape[1]],
+                device=token.device,
+                dtype=h.dtype,
+            )
+            feat, updated_cache = self.decoder.forward_prepared_prompt_cache_source(
+                source_mu=source_mu,
+                source_cond=source_cond,
+                n_timesteps=10,
+                spks=embedding,
+                streaming=streaming,
+                prompt_cache_steps=prompt_cache_steps,
+                source_cache_len=source_cache_len,
+                source_cache_end=source_cache_end,
+                source_mel_offset=source_mel_offset,
+            )
+            feat = feat[:, :, base_prompt_mel_len:]
+            assert feat.shape[2] == decoder_prompt_len - base_prompt_mel_len + h.shape[1]
+            return feat.float(), updated_cache
 
         total_mel_len = decoder_prompt_len + h.shape[1]
         mu = torch.zeros([1, total_mel_len, self.output_size], device=token.device, dtype=h.dtype)

@@ -591,6 +591,104 @@ class CausalConditionalCFM(ConditionalCFM):
             )
         return sample, updated_cache
 
+    def forward_prepared_prompt_cache_source(
+        self,
+        source_mu,
+        source_cond,
+        n_timesteps,
+        temperature=1.0,
+        spks=None,
+        prompt_cache_steps=None,
+        source_cache_len=0,
+        source_cache_end=0,
+        source_mel_offset=0,
+        streaming=False,
+    ):
+        source_x = self.noise_slice(
+            int(source_mel_offset or 0),
+            source_mu.size(2),
+            device=source_mu.device,
+            dtype=source_mu.dtype,
+        ) * temperature
+        t_span = torch.linspace(0, 1, n_timesteps + 1, device=source_mu.device, dtype=source_mu.dtype)
+        if self.t_scheduler == 'cosine':
+            t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
+        return self.solve_euler_prepared_prompt_cache_source(
+            source_x,
+            t_span=t_span,
+            source_mu=source_mu,
+            spks=spks,
+            source_cond=source_cond,
+            prompt_cache_steps=prompt_cache_steps,
+            source_cache_len=source_cache_len,
+            source_cache_end=source_cache_end,
+            source_mel_offset=source_mel_offset,
+            streaming=streaming,
+        )
+
+    def solve_euler_prepared_prompt_cache_source(
+        self,
+        source_x,
+        t_span,
+        source_mu,
+        spks,
+        source_cond,
+        prompt_cache_steps,
+        source_cache_len=0,
+        source_cache_end=0,
+        source_mel_offset=0,
+        streaming=False,
+    ):
+        if prompt_cache_steps is None:
+            raise ValueError("prompt_cache_steps is required for source-only prompt-cache inference")
+
+        t, _, dt = t_span[0], t_span[-1], t_span[1] - t_span[0]
+        t = t.unsqueeze(dim=0)
+        collect_source_cache = source_cache_len > 0
+        source_cache_end = source_x.shape[2] if source_cache_end <= 0 else min(source_cache_end, source_x.shape[2])
+        source_cache_start = max(0, source_cache_end - source_cache_len)
+
+        source_step_caches = []
+        for step, step_cache in enumerate(prompt_cache_steps["steps"], start=1):
+            source_dphi, source_step_cache = self.forward_source_with_prepared_prompt_cache(
+                source_x,
+                source_mu,
+                t,
+                spks,
+                source_cond,
+                step_cache,
+                streaming=streaming,
+                return_source_cache=collect_source_cache,
+                source_mel_offset=source_mel_offset,
+            )
+            if collect_source_cache:
+                source_step_cache = self.prepare_source_step_cache_for_history_storage(
+                    source_step_cache,
+                    step_cache["prompt_cache"],
+                    source_cache_start,
+                    source_cache_end,
+                )
+                source_step_caches.append(source_step_cache)
+            source_dphi, source_cfg_dphi = torch.split(source_dphi, [source_x.size(0), source_x.size(0)], dim=0)
+            source_dphi = ((1.0 + self.inference_cfg_rate) * source_dphi - self.inference_cfg_rate * source_cfg_dphi)
+            source_x = source_x + dt * source_dphi
+            t = t + dt
+            if step < len(t_span) - 1:
+                dt = t_span[step + 1] - t
+
+        final_prompt_x = prompt_cache_steps["final_prompt_x"].to(device=source_x.device, dtype=source_x.dtype)
+        sample = torch.cat([final_prompt_x, source_x], dim=2).float()
+        updated_cache = None
+        if collect_source_cache:
+            updated_cache = self.build_bounded_source_cache(
+                prompt_cache_steps=prompt_cache_steps,
+                source_step_caches=source_step_caches,
+                source_x=source_x,
+                source_cache_len=source_cache_len,
+                source_cache_end=source_cache_end,
+            )
+        return sample, updated_cache
+
     def solve_euler_grouped_prompt_uncached(
         self,
         x,

@@ -13,6 +13,7 @@ from vc_studio_backend import (
     choose_full_prompt_cache_frames,
     prompt_cache_offload_kv_to_cpu,
     prompt_cache_storage_dtype,
+    realtime_output_sample_rate,
 )
 
 
@@ -35,6 +36,15 @@ def test_prompt_cache_dtype_and_offload_from_ui_settings() -> None:
     assert prompt_cache_storage_dtype(model, "float32") is None
     assert prompt_cache_offload_kv_to_cpu("cpu_offload") is True
     assert prompt_cache_offload_kv_to_cpu("device") is False
+    assert prompt_cache_storage_dtype(_DummyModel("cuda"), "auto") == torch.float16
+    assert prompt_cache_storage_dtype(_DummyModel("mps"), "auto") is None
+
+
+def test_realtime_output_sample_rate_defaults_to_device_friendly_rate(monkeypatch) -> None:
+    monkeypatch.delenv("VC_STUDIO_REALTIME_OUTPUT_SAMPLE_RATE", raising=False)
+    assert realtime_output_sample_rate(24000) == 48000
+    monkeypatch.setenv("VC_STUDIO_REALTIME_OUTPUT_SAMPLE_RATE", "model")
+    assert realtime_output_sample_rate(24000) == 24000
 
 
 def test_prompt_cache_budget_clips_by_seconds_and_memory() -> None:

@@ -68,6 +68,52 @@ def test_prepare_prompt_cache_can_store_step_kv_in_half_without_prompt_inputs() 
     assert value.dtype == torch.float16
 
 
+def test_prepared_prompt_cache_source_only_matches_full_path() -> None:
+    torch.manual_seed(16)
+    decoder = _tiny_decoder()
+    prompt_len = 8
+    source_len = 6
+    prompt_mu = torch.randn(1, 80, prompt_len)
+    prompt_cond = torch.randn(1, 80, prompt_len)
+    source_mu = torch.randn(1, 80, source_len)
+    source_cond = torch.randn(1, 80, source_len)
+    spks = torch.randn(1, 80)
+
+    with torch.inference_mode():
+        cache = decoder.prepare_prompt_cache(
+            mu=prompt_mu,
+            mask=torch.ones(1, 1, prompt_len, dtype=torch.bool),
+            n_timesteps=2,
+            spks=spks,
+            cond=prompt_cond,
+            streaming=True,
+        )
+        full_output, full_cache = decoder(
+            mu=torch.cat([prompt_mu, source_mu], dim=2),
+            mask=torch.ones(1, 1, prompt_len + source_len, dtype=torch.bool),
+            n_timesteps=2,
+            spks=spks,
+            cond=torch.cat([prompt_cond, source_cond], dim=2),
+            streaming=True,
+            prompt_len=prompt_len,
+            prompt_cache_steps=cache,
+            source_mel_offset=5,
+        )
+        source_only_output, source_only_cache = decoder.forward_prepared_prompt_cache_source(
+            source_mu=source_mu,
+            source_cond=source_cond,
+            n_timesteps=2,
+            spks=spks,
+            prompt_cache_steps=cache,
+            source_mel_offset=5,
+            streaming=True,
+        )
+
+    assert full_cache is None
+    assert source_only_cache is None
+    assert torch.allclose(source_only_output, full_output, atol=1e-6, rtol=1e-6)
+
+
 def test_prepare_soft_prompt_cache_can_store_step_kv() -> None:
     torch.manual_seed(13)
     flow = _tiny_flow()

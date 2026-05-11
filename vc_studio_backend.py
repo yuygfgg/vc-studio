@@ -404,7 +404,7 @@ def normalize_prompt_runtime_policy(policy: str | None) -> str:
 def prompt_cache_storage_dtype(model: VCOnlyModel, mode: str | None = None) -> torch.dtype | None:
     value = (mode or os.environ.get("VC_STUDIO_PROMPT_CACHE_DTYPE", "auto")).strip().lower()
     if value in {"", "auto"}:
-        if model.device.type in {"cuda", "mps"}:
+        if model.device.type == "cuda":
             return torch.float16
         return None
     if value in {"float32", "fp32", "none", "off"}:
@@ -1059,6 +1059,7 @@ def stream_context_log_lines(
 LAVASR_INPUT_SAMPLE_RATE = 16000
 LAVASR_OUTPUT_SAMPLE_RATE = 48000
 DEFAULT_LAVASR_DEVICE = "cpu"
+DEFAULT_REALTIME_OUTPUT_SAMPLE_RATE = 48000
 
 
 def validate_lavasr_lowpass_hz(lowpass_hz: float, input_sample_rate: int = LAVASR_INPUT_SAMPLE_RATE) -> float:
@@ -1213,6 +1214,52 @@ def add_lavasr_row_stats(row: dict, stats: dict[str, Any]) -> dict:
     input_seconds = float(updated.get("input_seconds", 0.0))
     updated["chunk_rtf"] = updated["compute_seconds"] / input_seconds if input_seconds > 0 else 0.0
     updated["output_seconds"] = stats.get("lavasr_output_samples", 0) / LAVASR_OUTPUT_SAMPLE_RATE
+    return updated
+
+
+def realtime_output_sample_rate(model_sample_rate: int) -> int:
+    value = os.environ.get("VC_STUDIO_REALTIME_OUTPUT_SAMPLE_RATE", "auto").strip().lower()
+    if value in {"", "auto"}:
+        return DEFAULT_REALTIME_OUTPUT_SAMPLE_RATE if model_sample_rate != DEFAULT_REALTIME_OUTPUT_SAMPLE_RATE else model_sample_rate
+    if value in {"model", "native", "source"}:
+        return model_sample_rate
+    try:
+        sample_rate = int(float(value))
+    except ValueError:
+        return model_sample_rate
+    return sample_rate if sample_rate > 0 else model_sample_rate
+
+
+def resample_realtime_output(audio: torch.Tensor, input_sample_rate: int, output_sample_rate: int) -> torch.Tensor:
+    if input_sample_rate == output_sample_rate:
+        return audio
+    audio = normalize_audio_tensor(audio)
+    target_samples = round(audio.shape[-1] * output_sample_rate / input_sample_rate)
+    resampled = torchaudio_functional.resample(
+        audio,
+        orig_freq=input_sample_rate,
+        new_freq=output_sample_rate,
+        lowpass_filter_width=16,
+        rolloff=0.95,
+    )
+    return fit_audio_length(resampled, target_samples)
+
+
+def add_realtime_resample_row_stats(
+    row: dict,
+    *,
+    seconds: float,
+    output_samples: int,
+    output_sample_rate: int,
+) -> dict:
+    updated = dict(row)
+    updated["output_resample_seconds"] = float(seconds)
+    updated["compute_seconds"] = float(updated.get("compute_seconds", 0.0)) + float(seconds)
+    updated["wall_end_seconds"] = float(updated.get("wall_end_seconds", 0.0)) + float(seconds)
+    input_seconds = float(updated.get("input_seconds", 0.0))
+    updated["chunk_rtf"] = updated["compute_seconds"] / input_seconds if input_seconds > 0 else 0.0
+    updated["output_seconds"] = int(output_samples) / int(output_sample_rate) if output_sample_rate > 0 else 0.0
+    updated["output_sample_rate"] = int(output_sample_rate)
     return updated
 
 
@@ -1558,16 +1605,18 @@ class AsyncSourceTokenizer:
                     self._window_audio_samples += window_end - window_start
                     self._tokenize_seconds += tokenize_seconds
                     self._vad_compute_seconds += vad_seconds
-                    if vad_is_speech:
-                        self._vad_speech_chunks += 1
-                    else:
-                        self._vad_silence_chunks += 1
-                        self._vad_silence_samples += current_end - start
+                    if self.vad_gate is not None:
+                        if vad_is_speech:
+                            self._vad_speech_chunks += 1
+                        else:
+                            self._vad_silence_chunks += 1
+                            self._vad_silence_samples += current_end - start
                     if token.shape[1] > 0:
                         token_start = self._token_count
                         self._token_chunks.append(token)
                         self._token_count += token.shape[1]
-                        self._speech_spans.append((token_start, self._token_count, vad_is_speech))
+                        if self.vad_gate is not None:
+                            self._speech_spans.append((token_start, self._token_count, vad_is_speech))
                     self._condition.notify_all()
         except BaseException as error:
             with self._condition:
@@ -1646,6 +1695,7 @@ class MicrophoneSourceTokenizer:
         self._token_chunks: list[torch.Tensor] = []
         self._speech_spans: list[tuple[int, int, bool]] = []
         self._audio = np.zeros(0, dtype=np.float32)
+        self._audio_base_sample = 0
         self._next_start_sample = 0
         self._token_count = 0
         self._done = False
@@ -1813,7 +1863,7 @@ class MicrophoneSourceTokenizer:
                 self._condition.notify_all()
 
     def _process_available(self, final: bool) -> None:
-        total_samples = self._audio.shape[0]
+        total_samples = self._audio_base_sample + self._audio.shape[0]
         while self._next_start_sample < total_samples:
             start = self._next_start_sample
             target_current_end = start + self.chunk_samples
@@ -1822,15 +1872,19 @@ class MicrophoneSourceTokenizer:
             current_end = min(target_current_end, total_samples)
             if current_end <= start:
                 break
-            window_start = max(0, start - self.left_context_samples)
+            window_start = max(self._audio_base_sample, start - self.left_context_samples)
             window_end = min(total_samples, current_end + self.right_context_samples)
+            start_local = start - self._audio_base_sample
+            current_end_local = current_end - self._audio_base_sample
+            window_start_local = window_start - self._audio_base_sample
+            window_end_local = window_end - self._audio_base_sample
             vad_is_speech = True
             vad_seconds = 0.0
             if self.vad_gate is not None:
                 vad_start = time.perf_counter()
-                vad_is_speech = self.vad_gate.is_speech(self._audio[start:current_end])
+                vad_is_speech = self.vad_gate.is_speech(self._audio[start_local:current_end_local])
                 vad_seconds = time.perf_counter() - vad_start
-            window_audio = self._audio[window_start:window_end].copy()
+            window_audio = self._audio[window_start_local:window_end_local].copy()
             chunk = torch.from_numpy(window_audio).float().unsqueeze(0)
             tokenize_start = time.perf_counter()
             token = self.model.features.speech_token(chunk).cpu()
@@ -1848,18 +1902,31 @@ class MicrophoneSourceTokenizer:
                 self._window_audio_samples += window_end - window_start
                 self._tokenize_seconds += tokenize_seconds
                 self._vad_compute_seconds += vad_seconds
-                if vad_is_speech:
-                    self._vad_speech_chunks += 1
-                else:
-                    self._vad_silence_chunks += 1
-                    self._vad_silence_samples += current_end - start
+                if self.vad_gate is not None:
+                    if vad_is_speech:
+                        self._vad_speech_chunks += 1
+                    else:
+                        self._vad_silence_chunks += 1
+                        self._vad_silence_samples += current_end - start
                 if token.shape[1] > 0:
                     token_start = self._token_count
                     self._token_chunks.append(token)
                     self._token_count += token.shape[1]
-                    self._speech_spans.append((token_start, self._token_count, vad_is_speech))
+                    if self.vad_gate is not None:
+                        self._speech_spans.append((token_start, self._token_count, vad_is_speech))
                 self._condition.notify_all()
             self._next_start_sample = current_end
+        self._trim_audio_buffer()
+
+    def _trim_audio_buffer(self) -> None:
+        keep_from = max(0, self._next_start_sample - self.left_context_samples)
+        if keep_from <= self._audio_base_sample:
+            return
+        drop = min(keep_from - self._audio_base_sample, self._audio.shape[0])
+        if drop <= 0:
+            return
+        self._audio = self._audio[drop:].copy()
+        self._audio_base_sample += drop
 
     def _raise_if_error(self) -> None:
         with self._condition:
@@ -1899,11 +1966,20 @@ class RealtimeAudioPlayer:
         sample_rate: int,
         output_device: int | None = None,
         log_fn: Callable[[str], None] | None = None,
+        prebuffer_seconds: float | None = None,
     ):
         self.sample_rate = sample_rate
         self.output_device = output_device
         self.log_fn = log_fn
+        if prebuffer_seconds is None:
+            try:
+                prebuffer_seconds = float(os.environ.get("VC_STUDIO_REALTIME_PREBUFFER_SEC", "0.35"))
+            except ValueError:
+                prebuffer_seconds = 0.35
+        self.prebuffer_seconds = max(0.0, float(prebuffer_seconds))
+        self._prebuffer_samples = round(self.prebuffer_seconds * self.sample_rate)
         self._stream = None
+        self._stream_lock = threading.Lock()
         self._lock = threading.Lock()
         self._chunks: deque[np.ndarray] = deque()
         self._offset = 0
@@ -1911,35 +1987,56 @@ class RealtimeAudioPlayer:
         self._played_samples = 0
         self._underflows = 0
         self._has_written = False
+        self._playback_started = self._prebuffer_samples <= 0
+        self._start_requested = False
 
     def start(self) -> None:
-        try:
-            import sounddevice as sd
-        except ImportError as error:
-            raise RuntimeError("sounddevice is required for realtime playback") from error
-        self._stream = sd.OutputStream(
-            samplerate=self.sample_rate,
-            channels=1,
-            dtype="float32",
-            blocksize=0,
-            device=self.output_device,
-            callback=self._callback,
-        )
-        self._stream.start()
+        self._start_requested = True
+        if self._prebuffer_samples <= 0:
+            self._ensure_stream_started()
+
+    def _ensure_stream_started(self) -> None:
+        with self._stream_lock:
+            if self._stream is not None:
+                return
+            try:
+                import sounddevice as sd
+            except ImportError as error:
+                raise RuntimeError("sounddevice is required for realtime playback") from error
+            stream = sd.OutputStream(
+                samplerate=self.sample_rate,
+                channels=1,
+                dtype="float32",
+                blocksize=0,
+                device=self.output_device,
+                callback=self._callback,
+            )
+            self._stream = stream
+            stream.start()
 
     def write(self, speech: torch.Tensor) -> None:
         audio = speech.detach().cpu().squeeze(0).numpy().astype(np.float32)
         audio = np.clip(audio, -0.999, 0.999)
         if audio.size == 0:
             return
+        should_start = False
         with self._lock:
             self._chunks.append(audio)
             self._queued_samples += int(audio.size)
             self._has_written = True
+            buffered = self._queued_samples - self._played_samples
+            should_start = (
+                self._start_requested
+                and self._stream is None
+                and buffered >= self._prebuffer_samples
+            )
+        if should_start:
+            self._ensure_stream_started()
 
     def stop(self) -> None:
-        stream = self._stream
-        self._stream = None
+        with self._stream_lock:
+            stream = self._stream
+            self._stream = None
         if stream is not None:
             stream.stop()
             stream.close()
@@ -1947,10 +2044,14 @@ class RealtimeAudioPlayer:
     def stats(self) -> dict:
         with self._lock:
             buffered = self._queued_samples - self._played_samples
+            stream_started = self._stream is not None
             return {
                 "buffer_seconds": max(0, buffered) / self.sample_rate,
                 "played_seconds": self._played_samples / self.sample_rate,
                 "underflows": self._underflows,
+                "prebuffer_seconds": self.prebuffer_seconds,
+                "playback_started": self._playback_started,
+                "stream_started": stream_started,
             }
 
     def _callback(self, outdata, frames, time_info, status) -> None:
@@ -1959,6 +2060,12 @@ class RealtimeAudioPlayer:
         out = np.zeros(frames, dtype=np.float32)
         filled = 0
         with self._lock:
+            buffered = self._queued_samples - self._played_samples
+            if not self._playback_started:
+                if buffered < self._prebuffer_samples:
+                    outdata[:, 0] = out
+                    return
+                self._playback_started = True
             while filled < frames and self._chunks:
                 chunk = self._chunks[0]
                 available = chunk.shape[0] - self._offset
@@ -1970,7 +2077,7 @@ class RealtimeAudioPlayer:
                     self._chunks.popleft()
                     self._offset = 0
             self._played_samples += filled
-            if filled < frames and self._has_written:
+            if filled < frames and self._playback_started and self._has_written:
                 self._underflows += 1
         outdata[:, 0] = out
 
@@ -1995,7 +2102,7 @@ def run_window_stream(
     prompt_cache_steps,
     grouped_prompt_inputs: dict[str, Any] | None = None,
     soft_prompt_inputs: dict[str, torch.Tensor] | None = None,
-    on_audio_chunk: Callable[[torch.Tensor, dict], None] | None = None,
+    on_audio_chunk: Callable[[torch.Tensor, dict], dict | None] | None = None,
     log_fn: Callable[[str], None] | None = print,
     stop_event: threading.Event | None = None,
     collect_chunks: bool = True,
@@ -2224,7 +2331,9 @@ def run_window_stream(
             )
         )
         if on_audio_chunk is not None:
-            on_audio_chunk(speech_chunk_cpu, rows[-1])
+            updated_row = on_audio_chunk(speech_chunk_cpu, rows[-1])
+            if updated_row is not None:
+                rows[-1] = updated_row
         if log_fn is not None:
             print_chunk(rows[-1], chunk_start_wall, log_fn=log_fn)
 
@@ -2985,7 +3094,7 @@ class VCStudioBackend:
             for line in stream_context_log_lines(model, config.settings, context):
                 log_fn(line)
             lavasr = None
-            output_sample_rate = model.sample_rate
+            output_sample_rate = realtime_output_sample_rate(model.sample_rate)
             if config.settings.lavasr_enabled:
                 status_fn("Loading LavaSR...")
                 lavasr = create_lavasr_extender(config.settings, log_fn=log_fn)
@@ -2998,6 +3107,8 @@ class VCStudioBackend:
                 output_device=config.output_device,
                 log_fn=log_fn,
             )
+            log_fn(f"realtime_prebuffer_seconds={player.prebuffer_seconds:.3f}")
+            log_fn(f"realtime_output_sample_rate={output_sample_rate}")
             player.start()
             source = MicrophoneSourceTokenizer(
                 model=model,
@@ -3014,14 +3125,26 @@ class VCStudioBackend:
             source.start()
             status_fn("Live stream is running.")
 
-            def handle_chunk(speech_chunk: torch.Tensor, row: dict) -> None:
+            def handle_chunk(speech_chunk: torch.Tensor, row: dict) -> dict:
                 metric_row = row
+                chunk_sample_rate = model.sample_rate
                 if lavasr is not None:
                     speech_chunk, lavasr_stats = lavasr.enhance(speech_chunk, model.sample_rate)
+                    chunk_sample_rate = lavasr.output_sample_rate
                     metric_row = add_lavasr_row_stats(row, lavasr_stats)
+                if chunk_sample_rate != output_sample_rate:
+                    resample_start = time.perf_counter()
+                    speech_chunk = resample_realtime_output(speech_chunk, chunk_sample_rate, output_sample_rate)
+                    metric_row = add_realtime_resample_row_stats(
+                        metric_row,
+                        seconds=time.perf_counter() - resample_start,
+                        output_samples=int(speech_chunk.shape[-1]),
+                        output_sample_rate=output_sample_rate,
+                    )
                 if player is not None:
                     player.write(speech_chunk)
                     metrics_fn(metric_row, player.stats())
+                return metric_row
 
             run_window_stream(
                 model=model,
