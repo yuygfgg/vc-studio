@@ -5,14 +5,18 @@ import sys
 from types import SimpleNamespace
 
 import torch
-import torch.nn.functional as F
 from omegaconf import DictConfig
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cosyvoice.flow.DiT.dit import DiT
 from cosyvoice.flow.flow_matching import CausalConditionalCFM
-from cosyvoice.vc.soft_prompt import multi_reference_soft_prompt_initialization, prepare_branch_teacher_records
+from cosyvoice.vc.soft_prompt import (
+    crop_branch_teacher_records,
+    multi_reference_soft_prompt_initialization,
+    prepare_branch_teacher_records,
+    resolve_soft_prompt_target_mel_frames,
+)
 from cosyvoice.vc.voice_package import VoicePromptBranch, VoicePromptInputs
 
 
@@ -164,7 +168,30 @@ def test_soft_prompt_hidden_forward_keeps_grad_on_prompt_mu() -> None:
     assert torch.isfinite(prompt_mu.grad).all()
 
 
-def test_soft_prompt_teacher_records_are_resampled_to_canonical_length() -> None:
+def test_grouped_prompt_distill_can_use_canonical_source_positions() -> None:
+    torch.manual_seed(17)
+    estimator = _tiny_decoder().estimator
+    hidden = estimator.forward_grouped_prompt_source_until_layer(
+        branch_prompt_x=[torch.randn(1, 80, 4), torch.randn(1, 80, 6)],
+        branch_prompt_mu=[torch.randn(1, 80, 4), torch.randn(1, 80, 6)],
+        branch_prompt_cond=[torch.randn(1, 80, 4), torch.randn(1, 80, 6)],
+        branch_spks=[torch.randn(1, 80), torch.randn(1, 80)],
+        source_x=torch.randn(1, 80, 5),
+        source_mu=torch.randn(1, 80, 5),
+        t=torch.tensor(0.25),
+        source_spks=torch.randn(1, 80),
+        source_cond=torch.randn(1, 80, 5),
+        branch_weights=torch.tensor([0.5, 0.5]),
+        distill_layer=2,
+        dominant_branch_position=0,
+        streaming=True,
+        source_position_prompt_len=8,
+    )
+
+    assert hidden.shape == (2, 5, 16)
+
+
+def test_soft_prompt_teacher_records_keep_length_and_crop_long_windows() -> None:
     torch.manual_seed(15)
     model = _tiny_training_model()
     first_feat = torch.arange(12 * 80, dtype=torch.float32).reshape(1, 12, 80)
@@ -200,14 +227,26 @@ def test_soft_prompt_teacher_records_are_resampled_to_canonical_length() -> None
     )
 
     assert len(records) == 2
-    assert records[0]["mu"].shape == (1, 80, 8)
-    assert records[0]["cond"].shape == (1, 80, 8)
-    expected = F.interpolate(first_feat.transpose(1, 2), size=8, mode="linear", align_corners=False).transpose(1, 2)
-    assert torch.allclose(records[0]["cond"].transpose(1, 2), expected)
-    assert records[1]["mu"].shape == (1, 80, 8)
+    assert records[0]["mu"].shape == (1, 80, 12)
+    assert records[0]["cond"].shape == (1, 80, 12)
+    assert torch.allclose(records[0]["cond"].transpose(1, 2), first_feat)
+    assert records[1]["mu"].shape == (1, 80, 10)
+
+    cropped = crop_branch_teacher_records(
+        records,
+        max_frames=8,
+        random_crop=False,
+        frame_alignment=2,
+    )
+
+    assert cropped[0]["mu"].shape == (1, 80, 8)
+    assert cropped[0]["cond"].shape == (1, 80, 8)
+    assert cropped[0]["crop_start_mel_frame"] == 2
+    assert torch.allclose(cropped[0]["cond"].transpose(1, 2), first_feat[:, 2:10])
+    assert cropped[1]["mu"].shape == (1, 80, 8)
 
 
-def test_soft_prompt_initialization_uses_weighted_resampled_references() -> None:
+def test_soft_prompt_initialization_uses_weighted_cropped_reference_frames() -> None:
     torch.manual_seed(16)
     model = _tiny_training_model()
     first_feat = torch.ones(1, 12, 80)
@@ -243,11 +282,45 @@ def test_soft_prompt_initialization_uses_weighted_resampled_references() -> None
         target_frames=8,
     )
 
-    expected_first = F.interpolate(first_feat.transpose(1, 2), size=8, mode="linear", align_corners=False).transpose(1, 2)
-    expected_second = F.interpolate(second_feat.transpose(1, 2), size=8, mode="linear", align_corners=False).transpose(1, 2)
     assert initial_mu.shape == (1, 8, 80)
     assert initial_feat.shape == (1, 8, 80)
-    assert torch.allclose(initial_feat, expected_first * 0.25 + expected_second * 0.75)
+    assert torch.allclose(initial_feat[:, :4], torch.ones(1, 4, 80) * 2.5)
+    assert torch.allclose(initial_feat[:, 4:], torch.ones(1, 4, 80))
+
+
+def test_soft_prompt_target_length_is_capped_by_reference_length() -> None:
+    model = _tiny_training_model()
+    prompt_inputs = VoicePromptInputs(
+        branches=[
+            VoicePromptBranch(
+                prompt_token=torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.int32),
+                prompt_feat=torch.randn(1, 10, 80),
+                embedding=torch.randn(1, 192),
+                weight_raw=1.0,
+                weight_normalized=0.5,
+                metadata={"branch_index": 0},
+            ),
+            VoicePromptBranch(
+                prompt_token=torch.tensor([[2, 3, 4]], dtype=torch.int32),
+                prompt_feat=torch.randn(1, 6, 80),
+                embedding=torch.randn(1, 192),
+                weight_raw=1.0,
+                weight_normalized=0.5,
+                metadata={"branch_index": 1},
+            ),
+        ],
+        fused_embedding=torch.randn(1, 192),
+        metadata={"branch_weight_gamma": 1.0},
+    )
+
+    target_frames = resolve_soft_prompt_target_mel_frames(
+        model,
+        prompt_inputs,
+        active_indices=[0, 1],
+        seconds=15.0,
+    )
+
+    assert target_frames == 12
 
 
 def test_streaming_prompt_cache_preserves_padding_mask() -> None:

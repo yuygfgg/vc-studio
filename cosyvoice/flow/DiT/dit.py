@@ -544,6 +544,7 @@ class DiT(nn.Module):
         streaming=False,
         source_mel_offset=0,
         attention_temperature=1.0,
+        source_position_prompt_len=None,
     ):
         if not branch_prompt_x:
             raise ValueError("grouped prompt inputs have no active branches")
@@ -614,11 +615,13 @@ class DiT(nn.Module):
 
         dominant_branch_position = max(0, min(int(dominant_branch_position), branch_count - 1))
         prompt_len = branch_prompt_x[dominant_branch_position].shape[2]
+        position_prompt_len = prompt_len if source_position_prompt_len is None else int(source_position_prompt_len)
+        position_prompt_len = max(prompt_len, position_prompt_len)
         source_batch = source_x.size(0)
         x_source_in = torch.zeros([2 * source_batch, 80, source_len], device=source_x.device, dtype=source_spks.dtype)
         source_mu_in = torch.zeros([2 * source_batch, 80, source_len], device=source_x.device, dtype=source_spks.dtype)
         source_cond_in = torch.zeros([2 * source_batch, 80, source_len], device=source_x.device, dtype=source_spks.dtype)
-        full_mask_in = torch.ones([2 * source_batch, 1, prompt_len + source_len], device=source_x.device, dtype=torch.bool)
+        full_mask_in = torch.ones([2 * source_batch, 1, position_prompt_len + source_len], device=source_x.device, dtype=torch.bool)
         t_in = torch.zeros([2 * source_batch], device=source_x.device, dtype=source_spks.dtype)
         spks_in = torch.zeros([2 * source_batch, 80], device=source_x.device, dtype=source_spks.dtype)
         x_source_in[:] = source_x
@@ -635,15 +638,21 @@ class DiT(nn.Module):
             cache=branch_input_embed_caches[dominant_branch_position],
         )
 
-        source_position_base = int(prompt_len) + max(int(source_mel_offset), 0)
+        source_position_base = int(position_prompt_len) + max(int(source_mel_offset), 0)
         source_positions = torch.arange(source_len, device=source_hidden.device) + source_position_base
         source_rope = self.rotary_embed(source_positions)
-        positions = self.cached_source_positions(prompt_len + source_len, prompt_len, prompt_len, source_mel_offset, source_hidden.device)
+        positions = self.cached_source_positions(
+            position_prompt_len + source_len,
+            position_prompt_len,
+            position_prompt_len,
+            source_mel_offset,
+            source_hidden.device,
+        )
         if streaming is True:
             source_attn_mask = self.global_chunk_mask(full_mask_in.bool(), positions)
         else:
-            source_attn_mask = full_mask_in.bool().repeat(1, prompt_len + source_len, 1).unsqueeze(dim=1)
-        source_attn_mask = source_attn_mask[:, :, prompt_len:, :]
+            source_attn_mask = full_mask_in.bool().repeat(1, position_prompt_len + source_len, 1).unsqueeze(dim=1)
+        source_attn_mask = source_attn_mask[:, :, position_prompt_len:, :]
 
         for block in self.transformer_blocks:
             prompt_keys = []
@@ -839,6 +848,7 @@ class DiT(nn.Module):
         streaming=False,
         source_mel_offset=0,
         attention_temperature=1.0,
+        source_position_prompt_len=None,
     ):
         if not branch_prompt_x:
             raise ValueError("grouped prompt inputs have no active branches")
@@ -912,11 +922,13 @@ class DiT(nn.Module):
 
         dominant_branch_position = max(0, min(int(dominant_branch_position), branch_count - 1))
         prompt_len = branch_prompt_x[dominant_branch_position].shape[2]
+        position_prompt_len = prompt_len if source_position_prompt_len is None else int(source_position_prompt_len)
+        position_prompt_len = max(prompt_len, position_prompt_len)
         source_batch = source_x.size(0)
         x_source_in = torch.zeros([2 * source_batch, 80, source_len], device=source_x.device, dtype=source_spks.dtype)
         source_mu_in = torch.zeros([2 * source_batch, 80, source_len], device=source_x.device, dtype=source_spks.dtype)
         source_cond_in = torch.zeros([2 * source_batch, 80, source_len], device=source_x.device, dtype=source_spks.dtype)
-        full_mask_in = torch.ones([2 * source_batch, 1, prompt_len + source_len], device=source_x.device, dtype=torch.bool)
+        full_mask_in = torch.ones([2 * source_batch, 1, position_prompt_len + source_len], device=source_x.device, dtype=torch.bool)
         t_in = torch.zeros([2 * source_batch], device=source_x.device, dtype=source_spks.dtype)
         spks_in = torch.zeros([2 * source_batch, 80], device=source_x.device, dtype=source_spks.dtype)
         x_source_in[:] = source_x
@@ -933,16 +945,22 @@ class DiT(nn.Module):
             cache=branch_input_embed_caches[dominant_branch_position],
         )
 
-        source_position_base = int(prompt_len) + max(int(source_mel_offset), 0)
+        source_position_base = int(position_prompt_len) + max(int(source_mel_offset), 0)
         source_positions = torch.arange(source_len, device=source_hidden.device) + source_position_base
         source_rope = self.rotary_embed(source_positions)
-        positions = self.cached_source_positions(prompt_len + source_len, prompt_len, prompt_len, source_mel_offset, source_hidden.device)
+        positions = self.cached_source_positions(
+            position_prompt_len + source_len,
+            position_prompt_len,
+            position_prompt_len,
+            source_mel_offset,
+            source_hidden.device,
+        )
         if streaming is True:
             source_attn_mask = self.global_chunk_mask(full_mask_in.bool(), positions)
         else:
-            source_attn_mask = full_mask_in.bool().repeat(1, prompt_len + source_len, 1).unsqueeze(dim=1)
-        source_attn_mask = source_attn_mask[:, :, prompt_len:, :]
-        query_chunk_size = self.source_attention_query_chunk_size(source_len, prompt_len)
+            source_attn_mask = full_mask_in.bool().repeat(1, position_prompt_len + source_len, 1).unsqueeze(dim=1)
+        source_attn_mask = source_attn_mask[:, :, position_prompt_len:, :]
+        query_chunk_size = self.source_attention_query_chunk_size(source_len, position_prompt_len)
 
         for block in self.transformer_blocks[:layer_count]:
             branch_kv = []

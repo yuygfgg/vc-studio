@@ -330,9 +330,10 @@ package stores:
 - `soft_prompt_feat`: a fixed-length mel prompt condition.
 - `soft_speaker_embedding`: the normalized weighted speaker embedding.
 
-Let $R_T(\cdot)$ denote linear resampling to the configured soft prompt length
-$T$, measured in mel frames. The token path maps each reference token sequence to
-a mel-rate decoder conditioning sequence:
+Let $C_T(\cdot)$ denote center-cropping references longer than the soft prompt
+length $T$ while leaving shorter references at their native length. The token
+path maps each reference token sequence to a mel-rate decoder conditioning
+sequence:
 
 $$
 m_i =
@@ -346,27 +347,36 @@ m_i =
 \right).
 $$
 
-The soft prompt initialization is
+The soft prompt initialization uses only valid native frames from each reference
+and normalizes by the branch weights that cover each frame:
 
 $$
-\mu_0 = \sum_{i=1}^{B} w_i R_T(m_i),
+\mu_0[\tau] =
+\frac{\sum_{i:\tau < |C_T(m_i)|} w_i C_T(m_i)[\tau]}
+     {\sum_{i:\tau < |C_T(m_i)|} w_i},
 \qquad
-f_0 = \sum_{i=1}^{B} w_i R_T(y_i),
+\quad
+f_0[\tau] =
+\frac{\sum_{i:\tau < |C_T(y_i)|} w_i C_T(y_i)[\tau]}
+     {\sum_{i:\tau < |C_T(y_i)|} w_i},
 \qquad
 e_0 = \bar{e}.
 $$
 
-Over-length references are compressed into the canonical interval, shorter
-references are expanded to the same support, and equal-length references are left
-unchanged. No single reference is selected as the sole prompt carrier.
+Over-length references are croppedi into the canonical interval of the soft prompt.
+Shorter references keep their native frame sequence and simply stop contributing after
+their real length. No single reference is selected as the sole prompt carrier.
 
-Distillation optimizes only an additive residual $\Delta_\mu$:
+Distillation optimizes additive residuals on both decoder-conditioning prompt
+streams:
 
 $$
-\mu_{\mathrm{soft}} = \mu_0 + \Delta_\mu.
+\mu_{\mathrm{soft}} = \mu_0 + \Delta_\mu,
+\qquad
+f_{\mathrm{soft}} = f_0 + \Delta_f.
 $$
 
-All CosyVoice model parameters are frozen. The tensors $f_0$ and $e_0$ are also
+All CosyVoice model parameters are frozen. The speaker embedding $e_0$ is also
 frozen in the current implementation. For a sampled source token window $x$, a
 sampled diffusion time $t$, and a distillation layer $\ell$, the teacher is
 grouped branch attention and the student is the fixed soft prompt path:
@@ -375,7 +385,7 @@ $$
 h_T =
 H_{\ell}^{\mathrm{grouped}}
 \left(
-  x,\ t;\ \{m_i,\ y_i,\ e_i,\ w_i\}_{i=1}^{B}
+  x,\ t;\ \{\operatorname{window}_T(m_i),\operatorname{window}_T(y_i),\ e_i,\ w_i\}_{i=1}^{B}
 \right),
 $$
 
@@ -383,7 +393,7 @@ $$
 h_S =
 H_{\ell}^{\mathrm{soft}}
 \left(
-  x,\ t;\ \mu_0 + \Delta_\mu,\ f_0,\ e_0
+  x,\ t;\ \mu_0 + \Delta_\mu,\ f_0 + \Delta_f,\ e_0
 \right).
 $$
 
@@ -394,17 +404,19 @@ $$
 \mathbb{E}_{x,t}
 \left[
   \left\lVert h_S^{\mathrm{src}} - h_T^{\mathrm{src}} \right\rVert_2^2
-  + \lambda \left\lVert \Delta_\mu \right\rVert_2^2
-  + \beta \left\lVert D\Delta_\mu \right\rVert_2^2
+  + \lambda \left(\left\lVert \Delta_\mu \right\rVert_2^2 + \left\lVert \Delta_f \right\rVert_2^2\right)
+  + \beta \left(\left\lVert D\Delta_\mu \right\rVert_2^2 + \left\lVert D\Delta_f \right\rVert_2^2\right)
 \right],
 $$
 
 where $D$ is the first-order finite-difference operator along the prompt-time
 axis. The superscript $\mathrm{src}$ denotes the source-window slice of the
-hidden state; the prompt prefix is not used as a reconstruction target. Training
-windows are sampled from the weighted reference set. Therefore, adding reference audio
-increases the empirical support of the speaker adaptation problem while the
-inference-time prompt length remains $T$.
+hidden state; the prompt prefix is not used as a reconstruction target. Source
+training windows are sampled from the weighted reference set, and teacher prompt
+windows preserve native reference length unless a reference exceeds $T$, in which
+case a crop is sampled. Therefore, adding reference audio increases the empirical
+support of the speaker adaptation problem while the inference-time prompt length
+remains bounded by $T$.
 
 The resulting runtime complexities are
 

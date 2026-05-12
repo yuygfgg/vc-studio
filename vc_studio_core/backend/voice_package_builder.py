@@ -238,12 +238,12 @@ def create_voice_package(
             distill_layer=int(options_dict.get("soft_prompt_distill_layer", 6)),
             source_window_min_mel_frames=int(options_dict.get("soft_prompt_source_window_min_mel_frames", 50)),
             source_window_max_mel_frames=int(options_dict.get("soft_prompt_source_window_max_mel_frames", 100)),
-            learning_rate=float(options_dict.get("soft_prompt_learning_rate", 1e-2)),
+            learning_rate=float(options_dict.get("soft_prompt_learning_rate", 5e-4)),
             hidden_mse_weight=float(options_dict.get("soft_prompt_hidden_mse_weight", 1.0)),
             prompt_delta_l2_weight=float(options_dict.get("soft_prompt_delta_l2_weight", 1e-4)),
             prompt_smoothness_weight=float(options_dict.get("soft_prompt_smoothness_weight", 1e-4)),
             gradient_clip_norm=float(options_dict.get("soft_prompt_gradient_clip_norm", 1.0)),
-            validation_windows=int(options_dict.get("soft_prompt_validation_windows", 2)),
+            validation_windows=int(options_dict.get("soft_prompt_validation_windows", 8)),
             validation_every=int(options_dict.get("soft_prompt_validation_every", 50)),
             low_memory_free_gb=float(options_dict.get("soft_prompt_low_memory_free_gb", 14.0)),
             teacher_branch_subset_size=int(options_dict.get("soft_prompt_teacher_branch_subset_size", 0)),
@@ -413,4 +413,3 @@ def _voice_prompt_inputs_from_package_parts(
         fused_embedding=torch.from_numpy(fused_embedding).to(device=device, dtype=torch.float32),
         metadata=dict(metadata),
     )
-

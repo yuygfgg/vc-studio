@@ -33,13 +33,13 @@ class SoftPromptTrainingConfig:
     checkpoint_segments: int = DEFAULT_SOFT_PROMPT_CHECKPOINT_SEGMENTS
     source_window_min_mel_frames: int = 50
     source_window_max_mel_frames: int = 100
-    learning_rate: float = 1e-2
+    learning_rate: float = 5e-4
     hidden_mse_weight: float = 1.0
     prompt_delta_l2_weight: float = 1e-4
     prompt_smoothness_weight: float = 1e-4
     gradient_clip_norm: float = 1.0
     log_every: int = 25
-    validation_windows: int = 2
+    validation_windows: int = 8
     validation_every: int = 50
     low_memory_free_gb: float = 14.0
     teacher_branch_subset_size: int = 0
@@ -78,11 +78,12 @@ def distill_soft_prompt_v1(
     if not isinstance(model.flow.decoder.estimator, torch.nn.Module):
         raise RuntimeError("soft prompt distillation requires the PyTorch DiT estimator")
 
-    device = model.device
-    target_frames = align_soft_prompt_mel_frames(model, config.seconds)
     active_indices = prompt_inputs.active_branch_indices()
     if not active_indices:
         raise ValueError("voice package has no active prompt branches")
+    device = model.device
+    requested_frames = align_soft_prompt_mel_frames(model, config.seconds)
+    target_frames = resolve_soft_prompt_target_mel_frames(model, prompt_inputs, active_indices, config.seconds)
     dominant_index = prompt_inputs.dominant_branch_index()
 
     status_fn("Initializing soft prompt...")
@@ -120,9 +121,11 @@ def distill_soft_prompt_v1(
                 )
             )
         log_fn(
-            "soft_prompt_init=weighted_resampled_references "
-            "soft_prompt_teacher_branch_count={count} soft_prompt_teacher_mel_frames={frames}".format(
+            "soft_prompt_init=weighted_cropped_or_masked_references "
+            "soft_prompt_teacher_branch_count={count} "
+            "soft_prompt_requested_mel_frames={requested} soft_prompt_target_mel_frames={frames}".format(
                 count=len(branch_records),
+                requested=requested_frames,
                 frames=target_frames,
             )
         )
@@ -139,11 +142,12 @@ def distill_soft_prompt_v1(
         log_fn("soft_prompt_activation_checkpointing=off")
 
     final_loss = 0.0
-    trained_delta = None
+    trained_mu_delta = None
+    trained_feat_delta = None
     actual_steps = 0
     if config.steps > 0 and config.teacher_mode != "init_only":
         status_fn("Training soft prompt...")
-        final_loss, trained_delta = train_soft_prompt_delta(
+        final_loss, trained_mu_delta, trained_feat_delta = train_soft_prompt_delta(
             model,
             prompt_inputs,
             branch_records,
@@ -162,10 +166,13 @@ def distill_soft_prompt_v1(
         log_fn("soft_prompt_training_skipped=True")
 
     soft_prompt_mu = initial_mu.detach()
-    if isinstance(trained_delta, torch.Tensor):
-        soft_prompt_mu = soft_prompt_mu + trained_delta.to(device=soft_prompt_mu.device, dtype=soft_prompt_mu.dtype)
+    if isinstance(trained_mu_delta, torch.Tensor):
+        soft_prompt_mu = soft_prompt_mu + trained_mu_delta.to(device=soft_prompt_mu.device, dtype=soft_prompt_mu.dtype)
+    soft_prompt_feat = initial_feat.detach()
+    if isinstance(trained_feat_delta, torch.Tensor):
+        soft_prompt_feat = soft_prompt_feat + trained_feat_delta.to(device=soft_prompt_feat.device, dtype=soft_prompt_feat.dtype)
     soft_prompt_mu = soft_prompt_mu.detach().cpu().numpy().astype(np.float32)
-    soft_prompt_feat = initial_feat.detach().cpu().numpy().astype(np.float32)
+    soft_prompt_feat = soft_prompt_feat.detach().cpu().numpy().astype(np.float32)
     soft_speaker = soft_speaker_embedding.detach().cpu().numpy().astype(np.float32)
 
     metadata = {
@@ -173,18 +180,20 @@ def distill_soft_prompt_v1(
         "soft_prompt_version": SOFT_PROMPT_VERSION,
         "soft_prompt_mel_frames": int(target_frames),
         "soft_prompt_seconds": float(target_frames / (TOKEN_RATE * TOKEN_MEL_RATIO)),
-        "soft_prompt_init": "weighted_resampled_references",
+        "soft_prompt_init": "weighted_cropped_or_masked_references",
         "soft_prompt_training_steps": int(actual_steps),
         "soft_prompt_training_loss": "layer_hidden_distill_v1",
         "soft_prompt_teacher": "grouped_branch_attention_hidden_state",
         "soft_prompt_distill_layer": int(config.distill_layer),
         "soft_speaker_embedding_init": "weighted_fused_embedding",
         "soft_speaker_embedding_trainable": False,
+        "soft_prompt_feat_trainable": True,
         "soft_prompt_activation_checkpointing": config.activation_checkpointing,
         "soft_prompt_checkpoint_segments": int(config.checkpoint_segments),
         "soft_prompt_checkpoint_segments_used": int(checkpoint_segments),
         "soft_prompt_final_loss": float(final_loss),
-        "soft_prompt_reference_fit_policy": "linear_resample_each_reference_to_target_mel_frames",
+        "soft_prompt_requested_mel_frames": int(requested_frames),
+        "soft_prompt_reference_fit_policy": "preserve_reference_length_crop_over_target_mel_frames",
         "soft_prompt_source_window_policy": "weighted_random_reference_token_windows",
     }
     return SoftPromptTrainingResult(
@@ -213,7 +222,7 @@ def train_soft_prompt_delta(
     config: SoftPromptTrainingConfig,
     checkpoint_segments: int,
     log_fn: Callable[[str], None],
-) -> tuple[float, torch.Tensor]:
+) -> tuple[float, torch.Tensor, torch.Tensor]:
     device = model.device
     estimator = model.flow.decoder.estimator
     ratio = int(getattr(model, "token_mel_ratio", TOKEN_MEL_RATIO))
@@ -225,7 +234,8 @@ def train_soft_prompt_delta(
     branch_weights = branch_weights / branch_weights.sum()
     soft_spk = model.flow.spk_embed_affine_layer(soft_speaker_embedding).detach()
     mu_delta = torch.nn.Parameter(torch.zeros_like(initial_mu, device=device, dtype=torch.float32))
-    optimizer = torch.optim.AdamW([mu_delta], lr=float(config.learning_rate))
+    feat_delta = torch.nn.Parameter(torch.zeros_like(initial_feat, device=device, dtype=torch.float32))
+    optimizer = torch.optim.AdamW([mu_delta, feat_delta], lr=float(config.learning_rate))
     source_min_tokens = max(1, int(config.source_window_min_mel_frames) // ratio)
     source_max_tokens = max(source_min_tokens, int(config.source_window_max_mel_frames) // ratio)
     source_max_tokens = max(1, source_max_tokens)
@@ -236,7 +246,15 @@ def train_soft_prompt_delta(
     last_validation_loss = None
     best_validation_loss = None
     best_validation_step = 0
-    best_delta = None
+    best_mu_delta = None
+    best_feat_delta = None
+    training_windows = build_training_windows(
+        prompt_inputs,
+        active_indices,
+        source_min_tokens,
+        source_max_tokens,
+        count=max(1, int(config.steps)),
+    )
     validation_windows = build_validation_windows(
         prompt_inputs,
         active_indices,
@@ -244,11 +262,36 @@ def train_soft_prompt_delta(
         source_max_tokens,
         count=config.validation_windows,
     )
+    crop_rng = random.Random(2)
+    if validation_windows:
+        baseline_validation_loss = evaluate_soft_prompt_validation_loss(
+            model,
+            estimator,
+            branch_records,
+            branch_weights,
+            initial_mu=initial_mu,
+            initial_feat=initial_feat,
+            mu_delta=mu_delta.detach(),
+            feat_delta=feat_delta.detach(),
+            soft_spk=soft_spk,
+            validation_windows=validation_windows,
+            prompt_inputs=prompt_inputs,
+            config=config,
+            checkpoint_segments=checkpoint_segments,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
+        )
+        last_validation_loss = baseline_validation_loss
+        best_validation_loss = baseline_validation_loss
+        best_validation_step = 0
+        best_mu_delta = mu_delta.detach().clone()
+        best_feat_delta = feat_delta.detach().clone()
+        log_fn(f"soft_prompt_baseline_validation_hidden_mse={baseline_validation_loss:.6f}")
 
     with freeze_module_parameters(model.flow), torch.enable_grad():
         estimator.eval()
         for step in range(1, int(config.steps) + 1):
-            window = sample_source_window(prompt_inputs, active_indices, source_min_tokens, source_max_tokens)
+            window = training_windows[step - 1]
             source_token = window["token"].to(device=device, dtype=torch.int64)
             source_mel_offset = int(window["token_start"]) * ratio
             with torch.no_grad():
@@ -261,23 +304,30 @@ def train_soft_prompt_delta(
                     device=device,
                     dtype=torch.float32,
                 )
-                t = torch.rand((), device=device, dtype=torch.float32).clamp(0.02, 0.98)
+                t = torch.tensor(float(window["t"]), device=device, dtype=torch.float32)
                 teacher_records = choose_teacher_records(
                     branch_records,
                     branch_weights,
                     config.teacher_branch_subset_size,
                     dominant_index=dominant_index,
                 )
+                step_records = crop_branch_teacher_records(
+                    teacher_records["records"],
+                    max_frames=initial_mu.shape[1],
+                    random_crop=True,
+                    frame_alignment=ratio,
+                    rng=crop_rng,
+                )
                 teacher_branch_weights = teacher_records["weights"]
                 with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
                     teacher = estimator.forward_grouped_prompt_source_until_layer(
                         branch_prompt_x=[
                             model.flow.decoder.noise_slice(0, record["mu"].shape[2], device=device, dtype=torch.float32)
-                            for record in teacher_records["records"]
+                            for record in step_records
                         ],
-                        branch_prompt_mu=[record["mu"].to(device=device) for record in teacher_records["records"]],
-                        branch_prompt_cond=[record["cond"].to(device=device) for record in teacher_records["records"]],
-                        branch_spks=[record["spk"].to(device=device) for record in teacher_records["records"]],
+                        branch_prompt_mu=[record["mu"].to(device=device) for record in step_records],
+                        branch_prompt_cond=[record["cond"].to(device=device) for record in step_records],
+                        branch_spks=[record["spk"].to(device=device) for record in step_records],
                         source_x=source_x,
                         source_mu=source_mu,
                         t=t,
@@ -288,6 +338,7 @@ def train_soft_prompt_delta(
                         dominant_branch_position=teacher_records["dominant_position"],
                         streaming=True,
                         source_mel_offset=source_mel_offset,
+                        source_position_prompt_len=initial_mu.shape[1],
                         attention_temperature=float(prompt_inputs.metadata.get("attention_temperature", 1.0)),
                     )[:1].detach()
             empty_device_cache(device)
@@ -295,7 +346,7 @@ def train_soft_prompt_delta(
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
                 soft_mu = (initial_mu + mu_delta).transpose(1, 2).contiguous()
-                soft_cond = initial_feat.transpose(1, 2).contiguous()
+                soft_cond = (initial_feat + feat_delta).transpose(1, 2).contiguous()
                 prompt_x = model.flow.decoder.noise_slice(
                     0,
                     initial_mu.shape[1],
@@ -318,8 +369,11 @@ def train_soft_prompt_delta(
                     checkpoint_segments=checkpoint_segments,
                 )[:1]
                 hidden_loss = F.mse_loss(student.float(), teacher.to(device=student.device, dtype=student.dtype).float())
-                delta_l2 = mu_delta.float().pow(2).mean()
-                smoothness = (mu_delta[:, 1:] - mu_delta[:, :-1]).float().pow(2).mean()
+                delta_l2 = 0.5 * (mu_delta.float().pow(2).mean() + feat_delta.float().pow(2).mean())
+                smoothness = 0.5 * (
+                    (mu_delta[:, 1:] - mu_delta[:, :-1]).float().pow(2).mean()
+                    + (feat_delta[:, 1:] - feat_delta[:, :-1]).float().pow(2).mean()
+                )
                 loss = (
                     float(config.hidden_mse_weight) * hidden_loss
                     + float(config.prompt_delta_l2_weight) * delta_l2
@@ -327,7 +381,7 @@ def train_soft_prompt_delta(
                 )
             loss.backward()
             if config.gradient_clip_norm > 0:
-                torch.nn.utils.clip_grad_norm_([mu_delta], float(config.gradient_clip_norm))
+                torch.nn.utils.clip_grad_norm_([mu_delta, feat_delta], float(config.gradient_clip_norm))
             optimizer.step()
             last_loss = float(loss.detach().cpu().item())
             ema_loss = last_loss if ema_loss is None else 0.95 * ema_loss + 0.05 * last_loss
@@ -346,6 +400,7 @@ def train_soft_prompt_delta(
                         initial_mu=initial_mu,
                         initial_feat=initial_feat,
                         mu_delta=mu_delta,
+                        feat_delta=feat_delta,
                         soft_spk=soft_spk,
                         validation_windows=validation_windows,
                         prompt_inputs=prompt_inputs,
@@ -358,7 +413,8 @@ def train_soft_prompt_delta(
                     if best_validation_loss is None or validation_loss < best_validation_loss:
                         best_validation_loss = validation_loss
                         best_validation_step = step
-                        best_delta = mu_delta.detach().clone()
+                        best_mu_delta = mu_delta.detach().clone()
+                        best_feat_delta = feat_delta.detach().clone()
                     empty_device_cache(device)
                 validation_text = (
                     ""
@@ -387,15 +443,15 @@ def train_soft_prompt_delta(
             del teacher, student, loss, hidden_loss, delta_l2, smoothness
             empty_device_cache(device)
 
-    if best_delta is not None and best_validation_loss is not None:
+    if best_mu_delta is not None and best_feat_delta is not None and best_validation_loss is not None:
         log_fn(
             "soft_prompt_selected_step={step} best_validation_hidden_mse={loss:.6f}".format(
                 step=best_validation_step,
                 loss=best_validation_loss,
             )
         )
-        return best_validation_loss, best_delta
-    return (last_validation_loss if last_validation_loss is not None else last_loss), mu_delta.detach()
+        return best_validation_loss, best_mu_delta, best_feat_delta
+    return (last_validation_loss if last_validation_loss is not None else last_loss), mu_delta.detach(), feat_delta.detach()
 
 
 def prepare_branch_teacher_records(
@@ -411,16 +467,20 @@ def prepare_branch_teacher_records(
         branch = prompt_inputs.branches[branch_index]
         token = branch.prompt_token.to(device=target_device)
         feat = branch.prompt_feat.to(device=target_device, dtype=torch.float32)
-        feat = fit_frames(feat, target_frames)
-        mu = branch_prompt_mu(model, token, target_frames=target_frames).transpose(1, 2).contiguous()
+        mu, feat = align_reference_mu_and_feat(
+            branch_prompt_mu(model, token, target_frames=None).to(device=target_device),
+            feat,
+        )
         embedding = F.normalize(branch.embedding.to(device=target_device, dtype=torch.float32), dim=1)
         spk = model.flow.spk_embed_affine_layer(embedding)
         records.append(
             {
                 "branch_index": branch_index,
-                "mu": mu.detach(),
+                "mu": mu.transpose(1, 2).contiguous().detach(),
                 "cond": feat.transpose(1, 2).contiguous().detach(),
                 "spk": spk.detach(),
+                "source_mel_frames": int(feat.shape[1]),
+                "teacher_max_mel_frames": int(target_frames),
             }
         )
     return records
@@ -436,26 +496,132 @@ def multi_reference_soft_prompt_initialization(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     mu_accum = None
     feat_accum = None
+    weight_accum = None
     for position, branch_index in enumerate(active_indices):
         branch = prompt_inputs.branches[branch_index]
         weight = branch_weights[position].to(device=model.device, dtype=torch.float32)
-        branch_mu = branch_prompt_mu(
-            model,
-            branch.prompt_token.to(model.device),
-            target_frames=target_frames,
-        )
-        branch_feat = fit_frames(
+        branch_mu, branch_feat = align_reference_mu_and_feat(
+            branch_prompt_mu(
+                model,
+                branch.prompt_token.to(model.device),
+                target_frames=None,
+            ),
             branch.prompt_feat.to(device=model.device, dtype=torch.float32),
+        )
+        branch_mu = fit_initial_prompt_frames(
+            branch_mu,
             target_frames,
         )
-        mu_accum = branch_mu * weight if mu_accum is None else mu_accum + branch_mu * weight
-        feat_accum = branch_feat * weight if feat_accum is None else feat_accum + branch_feat * weight
-    if mu_accum is None or feat_accum is None:
+        branch_feat = fit_initial_prompt_frames(
+            branch_feat,
+            target_frames,
+        )
+        length = branch_mu.shape[1]
+        if mu_accum is None:
+            mu_accum = torch.zeros(1, target_frames, branch_mu.shape[2], device=model.device, dtype=torch.float32)
+            feat_accum = torch.zeros(1, target_frames, branch_feat.shape[2], device=model.device, dtype=torch.float32)
+            weight_accum = torch.zeros(1, target_frames, 1, device=model.device, dtype=torch.float32)
+        mu_accum[:, :length] = mu_accum[:, :length] + branch_mu * weight
+        feat_accum[:, :length] = feat_accum[:, :length] + branch_feat * weight
+        weight_accum[:, :length] = weight_accum[:, :length] + weight
+    if mu_accum is None or feat_accum is None or weight_accum is None:
         raise ValueError("cannot initialize soft prompt without active references")
+    valid = weight_accum > 0
+    mu_accum = torch.where(valid, mu_accum / weight_accum.clamp_min(1e-8), mu_accum)
+    feat_accum = torch.where(valid, feat_accum / weight_accum.clamp_min(1e-8), feat_accum)
+    fill_uncovered_tail(mu_accum, valid)
+    fill_uncovered_tail(feat_accum, valid)
     return mu_accum.to(dtype=torch.float32), feat_accum.to(dtype=torch.float32)
 
 
-def branch_prompt_mu(model: Any, prompt_token: torch.Tensor, target_frames: int) -> torch.Tensor:
+def align_reference_mu_and_feat(mu: torch.Tensor, feat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    if mu.ndim != 3 or feat.ndim != 3 or mu.shape[0] != 1 or feat.shape[0] != 1:
+        raise ValueError(f"expected [1, T, C] tensors, got {tuple(mu.shape)} and {tuple(feat.shape)}")
+    frames = min(int(mu.shape[1]), int(feat.shape[1]))
+    if frames <= 0:
+        raise ValueError("prompt reference has no aligned mel frames")
+    return (
+        mu[:, :frames].contiguous().to(dtype=torch.float32),
+        feat[:, :frames].contiguous().to(dtype=torch.float32),
+    )
+
+
+def fit_initial_prompt_frames(tensor: torch.Tensor, target_frames: int) -> torch.Tensor:
+    if tensor.ndim != 3 or tensor.shape[0] != 1:
+        raise ValueError(f"expected a [1, T, C] tensor, got {tuple(tensor.shape)}")
+    target_frames = int(target_frames)
+    if target_frames <= 0:
+        raise ValueError("target_frames must be greater than 0")
+    frames = int(tensor.shape[1])
+    if frames <= 0:
+        return torch.zeros(1, 0, tensor.shape[2], device=tensor.device, dtype=torch.float32)
+    if frames <= target_frames:
+        return tensor.to(dtype=torch.float32)
+    start = (frames - target_frames) // 2
+    return tensor[:, start:start + target_frames].contiguous().to(dtype=torch.float32)
+
+
+def fill_uncovered_tail(tensor: torch.Tensor, valid: torch.Tensor) -> None:
+    covered_frames = torch.nonzero(valid[0, :, 0], as_tuple=False).flatten()
+    if covered_frames.numel() <= 0:
+        return
+    last = int(covered_frames[-1].item())
+    if last + 1 < tensor.shape[1]:
+        tensor[:, last + 1:] = tensor[:, last:last + 1]
+
+
+def crop_branch_teacher_records(
+    records: list[dict[str, Any]],
+    *,
+    max_frames: int,
+    random_crop: bool,
+    frame_alignment: int = 1,
+    rng: random.Random | None = None,
+) -> list[dict[str, Any]]:
+    return [
+        crop_branch_teacher_record(
+            record,
+            max_frames=max_frames,
+            random_crop=random_crop,
+            frame_alignment=frame_alignment,
+            rng=rng,
+        )
+        for record in records
+    ]
+
+
+def crop_branch_teacher_record(
+    record: dict[str, Any],
+    *,
+    max_frames: int,
+    random_crop: bool,
+    frame_alignment: int = 1,
+    rng: random.Random | None = None,
+) -> dict[str, Any]:
+    max_frames = int(max_frames)
+    if max_frames <= 0:
+        raise ValueError("max_frames must be greater than 0")
+    length = int(record["mu"].shape[2])
+    if length <= max_frames:
+        return record
+    max_start = length - max_frames
+    alignment = max(1, int(frame_alignment))
+    if random_crop:
+        crop_rng = rng if rng is not None else random
+        start = crop_rng.randint(0, max_start // alignment) * alignment
+    else:
+        start = ((max_start // 2) // alignment) * alignment
+    end = start + max_frames
+    cropped = dict(record)
+    cropped["mu"] = record["mu"][:, :, start:end].contiguous()
+    cropped["cond"] = record["cond"][:, :, start:end].contiguous()
+    cropped["crop_start_mel_frame"] = int(start)
+    cropped["source_mel_frames"] = int(length)
+    cropped["teacher_max_mel_frames"] = int(max_frames)
+    return cropped
+
+
+def branch_prompt_mu(model: Any, prompt_token: torch.Tensor, target_frames: int | None = None) -> torch.Tensor:
     prompt_token = prompt_token.to(device=model.device, dtype=torch.int64)
     token_len = torch.tensor([prompt_token.shape[1]], dtype=torch.int32, device=model.device)
     mask = torch.ones((1, prompt_token.shape[1], 1), dtype=torch.float32, device=model.device)
@@ -465,7 +631,10 @@ def branch_prompt_mu(model: Any, prompt_token: torch.Tensor, target_frames: int)
         token_embed = torch.zeros(1, 0, model.flow.input_size, device=model.device)
     h = model.flow.pre_lookahead_layer(token_embed)
     h = h.repeat_interleave(model.token_mel_ratio, dim=1)
-    return fit_frames(h.to(dtype=torch.float32), target_frames)
+    h = h.to(dtype=torch.float32)
+    if target_frames is None:
+        return h
+    return fit_frames(h, target_frames)
 
 
 def source_token_mu(model: Any, source_token: torch.Tensor) -> torch.Tensor:
@@ -499,10 +668,10 @@ def frame_fit_policy(source_frames: int, target_frames: int) -> str:
     if source_frames == target_frames:
         return "exact"
     if source_frames <= 0:
-        return "zero_pad_empty"
+        return "empty_reference"
     if source_frames > target_frames:
-        return "linear_resample_compress"
-    return "linear_resample_stretch"
+        return "random_crop_to_target_mel_frames"
+    return "preserve_real_length"
 
 
 def align_soft_prompt_mel_frames(model: Any, seconds: float) -> int:
@@ -511,6 +680,24 @@ def align_soft_prompt_mel_frames(model: Any, seconds: float) -> int:
     if static_chunk <= 0:
         return raw_frames
     return max(static_chunk, int(math.ceil(raw_frames / static_chunk) * static_chunk))
+
+
+def resolve_soft_prompt_target_mel_frames(
+    model: Any,
+    prompt_inputs: VoicePromptInputs,
+    active_indices: list[int],
+    seconds: float,
+) -> int:
+    requested_frames = align_soft_prompt_mel_frames(model, seconds)
+    max_source_frames = max(
+        (int(prompt_inputs.branches[index].prompt_feat.shape[1]) for index in active_indices),
+        default=requested_frames,
+    )
+    target_frames = min(requested_frames, max(1, max_source_frames))
+    static_chunk = int(getattr(model.flow.decoder.estimator, "static_chunk_size", 0))
+    if static_chunk <= 0:
+        return target_frames
+    return max(static_chunk, int(math.ceil(target_frames / static_chunk) * static_chunk))
 
 
 def sample_source_window(
@@ -570,6 +757,41 @@ def build_validation_windows(
     return windows
 
 
+def build_training_windows(
+    prompt_inputs: VoicePromptInputs,
+    active_indices: list[int],
+    min_tokens: int,
+    max_tokens: int,
+    *,
+    count: int,
+) -> list[dict[str, Any]]:
+    rng = random.Random(1)
+    windows = []
+    weights = prompt_inputs.sharpened_weights()
+    active_weights = [weights[index] for index in active_indices]
+    for step in range(max(0, int(count))):
+        branch_index = rng.choices(active_indices, weights=active_weights, k=1)[0]
+        branch = prompt_inputs.branches[branch_index]
+        token = branch.prompt_token
+        if token.shape[1] <= 0:
+            continue
+        window_tokens = rng.randint(min_tokens, max_tokens)
+        window_tokens = min(max(1, window_tokens), token.shape[1])
+        start = 0 if token.shape[1] <= window_tokens else rng.randint(0, token.shape[1] - window_tokens)
+        phase = ((step + 1) * 0.6180339887498949) % 1.0
+        windows.append(
+            {
+                "branch_index": branch_index,
+                "token_start": start,
+                "token": token[:, start:start + window_tokens].clone(),
+                "t": 0.02 + 0.96 * phase,
+            }
+        )
+    if not windows:
+        raise ValueError("cannot build soft prompt training windows from empty prompt token branches")
+    return windows
+
+
 @torch.no_grad()
 def evaluate_soft_prompt_validation_loss(
     model: Any,
@@ -580,6 +802,7 @@ def evaluate_soft_prompt_validation_loss(
     initial_mu: torch.Tensor,
     initial_feat: torch.Tensor,
     mu_delta: torch.Tensor,
+    feat_delta: torch.Tensor,
     soft_spk: torch.Tensor,
     validation_windows: list[dict[str, Any]],
     prompt_inputs: VoicePromptInputs,
@@ -598,6 +821,12 @@ def evaluate_soft_prompt_validation_loss(
         0,
     )
     losses = []
+    teacher_records_for_validation = crop_branch_teacher_records(
+        branch_records,
+        max_frames=initial_mu.shape[1],
+        random_crop=False,
+        frame_alignment=ratio,
+    )
     for window in validation_windows:
         source_token = window["token"].to(device=device, dtype=torch.int64)
         source_mel_offset = int(window["token_start"]) * ratio
@@ -615,11 +844,11 @@ def evaluate_soft_prompt_validation_loss(
             teacher = estimator.forward_grouped_prompt_source_until_layer(
                 branch_prompt_x=[
                     model.flow.decoder.noise_slice(0, record["mu"].shape[2], device=device, dtype=torch.float32)
-                    for record in branch_records
+                    for record in teacher_records_for_validation
                 ],
-                branch_prompt_mu=[record["mu"].to(device=device) for record in branch_records],
-                branch_prompt_cond=[record["cond"].to(device=device) for record in branch_records],
-                branch_spks=[record["spk"].to(device=device) for record in branch_records],
+                branch_prompt_mu=[record["mu"].to(device=device) for record in teacher_records_for_validation],
+                branch_prompt_cond=[record["cond"].to(device=device) for record in teacher_records_for_validation],
+                branch_spks=[record["spk"].to(device=device) for record in teacher_records_for_validation],
                 source_x=source_x,
                 source_mu=source_mu,
                 t=t,
@@ -630,6 +859,7 @@ def evaluate_soft_prompt_validation_loss(
                 dominant_branch_position=dominant_position,
                 streaming=True,
                 source_mel_offset=source_mel_offset,
+                source_position_prompt_len=initial_mu.shape[1],
                 attention_temperature=float(prompt_inputs.metadata.get("attention_temperature", 1.0)),
             )[:1]
             student = estimator.forward_soft_prompt_source_until_layer(
@@ -640,7 +870,7 @@ def evaluate_soft_prompt_validation_loss(
                     dtype=source_x.dtype,
                 ),
                 prompt_mu=(initial_mu + mu_delta).transpose(1, 2).contiguous(),
-                prompt_cond=initial_feat.transpose(1, 2).contiguous(),
+                prompt_cond=(initial_feat + feat_delta).transpose(1, 2).contiguous(),
                 prompt_spks=soft_spk,
                 source_x=source_x,
                 source_mu=source_mu,
