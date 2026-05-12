@@ -254,11 +254,10 @@ The package-level speaker embedding is computed independently from prompt
 attention:
 
 $$
-\bar{e}
-=
-\operatorname{normalize}
+\bar{e} =
+\mathrm{normalize}
 \left(
-  \sum_{i=1}^{B} w_i\operatorname{normalize}(e_i)
+  \sum_{i=1}^{B} w_i\mathrm{normalize}(e_i)
 \right).
 $$
 
@@ -269,7 +268,7 @@ This common representation supports three runtime conditioning policies.
 Dominant mode selects a single prompt branch
 
 $$
-d = \operatorname*{arg\,max}_{i} w_i,
+d = \arg\max_i w_i,
 $$
 
 with deterministic lowest-index tie breaking. Runtime conditioning uses
@@ -278,8 +277,7 @@ prompt token and prompt mel context are sampled from one reference only. Its
 conditioning operator can be summarized as
 
 $$
-\mathcal{C}_{\mathrm{dom}}
-=
+\mathcal{C}_{\mathrm{dom}} =
 \left(z_d,\ y_d,\ \bar{e}\right).
 $$
 
@@ -294,12 +292,10 @@ $(K_{i,\ell}, V_{i,\ell})$. For a source query matrix $Q_\ell$, branch-local
 attention is evaluated as
 
 $$
-A_{i,\ell}
-=
-\operatorname{softmax}
+A_{i,\ell} =
+\mathrm{softmax}
 \left(
-  \frac{Q_\ell K_{i,\ell}^{\top}}{\sqrt{d_h}\,\tau}
-  + M_i
+  \frac{Q_\ell K_{i,\ell}^{\top}}{\sqrt{d_h}\,\tau} + M_i
 \right)V_{i,\ell},
 $$
 
@@ -308,8 +304,7 @@ $\tau$ is `attention_temperature`. The grouped prompt contribution is the
 weighted mixture
 
 $$
-A_{\ell}^{\mathrm{grouped}}
-=
+A_{\ell}^{\mathrm{grouped}} =
 \sum_{i=1}^{B} w_i A_{i,\ell}.
 $$
 
@@ -337,11 +332,11 @@ sequence:
 
 $$
 m_i =
-\operatorname{repeat\_interleave}
+\mathrm{repeat\_interleave}
 \left(
-  \operatorname{pre\_lookahead}
+  \mathrm{pre\_lookahead}
   \left(
-    \operatorname{input\_embedding}(z_i)
+    \mathrm{input\_embedding}(z_i)
   \right),
   q
 \right).
@@ -385,7 +380,7 @@ $$
 h_T =
 H_{\ell}^{\mathrm{grouped}}
 \left(
-  x,\ t;\ \{\operatorname{window}_T(m_i),\operatorname{window}_T(y_i),\ e_i,\ w_i\}_{i=1}^{B}
+  x,\ t;\ \{\mathrm{window}_T(m_i),\mathrm{window}_T(y_i),\ e_i,\ w_i\}_{i=1}^{B}
 \right),
 $$
 
@@ -403,9 +398,9 @@ $$
 \min_{\Delta_\mu}
 \mathbb{E}_{x,t}
 \left[
-  \left\lVert h_S^{\mathrm{src}} - h_T^{\mathrm{src}} \right\rVert_2^2
-  + \lambda \left(\left\lVert \Delta_\mu \right\rVert_2^2 + \left\lVert \Delta_f \right\rVert_2^2\right)
-  + \beta \left(\left\lVert D\Delta_\mu \right\rVert_2^2 + \left\lVert D\Delta_f \right\rVert_2^2\right)
+  \left\lVert h_S^{\mathrm{src}} - h_T^{\mathrm{src}} \right\rVert_2^2 +
+  \lambda \left(\left\lVert \Delta_\mu \right\rVert_2^2 + \left\lVert \Delta_f \right\rVert_2^2\right) +
+  \beta \left(\left\lVert D\Delta_\mu \right\rVert_2^2 + \left\lVert D\Delta_f \right\rVert_2^2\right)
 \right],
 $$
 
