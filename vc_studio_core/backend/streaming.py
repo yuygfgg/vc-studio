@@ -104,8 +104,8 @@ def run_window_stream(
         )
         active_cache_steps = history_cache if cache_hit else prompt_cache_steps
         active_cache_len = active_cache_steps["cache_len"] if active_cache_steps is not None else prompt_cache_len
-        source_cache_len = min(history_target_mel, current_mel) if use_history_kv_cache and active_cache_steps is not None else 0
-        source_cache_end = (0 if cache_hit else history_mel) + current_mel
+        source_cache_len = history_target_mel if use_history_kv_cache and active_cache_steps is not None else 0
+        source_cache_end = history_mel + current_mel
         source_mel_offset = (start_token if cache_hit else history_start) * model.token_mel_ratio
 
         flow_start = time.perf_counter()
