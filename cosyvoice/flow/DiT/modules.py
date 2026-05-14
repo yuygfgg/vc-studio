@@ -20,6 +20,12 @@ import torchaudio
 from x_transformers.x_transformers import apply_rotary_pos_emb
 
 
+def _to_device_dtype_if_needed(tensor: torch.Tensor, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    if tensor.device == device and tensor.dtype == dtype:
+        return tensor
+    return tensor.to(device=device, dtype=dtype)
+
+
 # raw wav to mel spec
 class MelSpec(nn.Module):
     def __init__(
@@ -388,6 +394,7 @@ class Attention(nn.Module):
 
         if self.context_pre_only is not None and not self.context_pre_only:
             self.to_out_c = nn.Linear(self.inner_dim, dim)
+        self._kv_workspace = {}
 
     def forward(
         self,
@@ -517,8 +524,8 @@ class Attention(nn.Module):
         attention_temperature: float = 1.0,
         query_chunk_size: int | None = None,
     ) -> torch.Tensor:
-        prompt_key = prompt_key.to(device=query.device, dtype=query.dtype)
-        prompt_value = prompt_value.to(device=query.device, dtype=query.dtype)
+        prompt_key = _to_device_dtype_if_needed(prompt_key, device=query.device, dtype=query.dtype)
+        prompt_value = _to_device_dtype_if_needed(prompt_value, device=query.device, dtype=query.dtype)
         prompt_mask = prompt_mask.to(device=query.device)
         branch_weights = branch_weights.to(device=query.device, dtype=query.dtype)
         branch_count, batch_size, heads, prompt_len, head_dim = prompt_key.shape
@@ -536,8 +543,8 @@ class Attention(nn.Module):
         if attention_temperature != 1.0:
             query = query / float(attention_temperature)
 
-        key = torch.cat([prompt_key, source_key], dim=2)
-        value = torch.cat([prompt_value, source_value], dim=2)
+        key = self._copy_context_segments([prompt_key, source_key], workspace_name="grouped_key", static_prefix_segments=1)
+        value = self._copy_context_segments([prompt_value, source_value], workspace_name="grouped_value", static_prefix_segments=1)
         attn_mask = self._grouped_prompt_attention_mask(
             prompt_mask=prompt_mask,
             source_mask=mask,
@@ -600,6 +607,51 @@ class Attention(nn.Module):
             1,
             query_len,
             prompt_len + source_context_len,
+        )
+
+    def _copy_context_segments(self, segments, workspace_name: str, static_prefix_segments: int = 0):
+        if len(segments) == 1:
+            return segments[0]
+        if torch.is_grad_enabled():
+            return torch.cat(segments, dim=2)
+        first = segments[0]
+        total_len = sum(segment.shape[2] for segment in segments)
+        shape = (first.shape[0], first.shape[1], total_len, first.shape[3])
+        buffer = self._kv_workspace.get(workspace_name)
+        if (
+            buffer is None
+            or buffer.shape != shape
+            or buffer.device != first.device
+            or buffer.dtype != first.dtype
+        ):
+            buffer = torch.empty(shape, device=first.device, dtype=first.dtype)
+            self._kv_workspace[workspace_name] = buffer
+            self._kv_workspace.pop(f"{workspace_name}_static_meta", None)
+        static_meta = self._kv_workspace.get(f"{workspace_name}_static_meta")
+        next_static_meta = []
+        offset = 0
+        static_prefix_segments = min(max(0, int(static_prefix_segments)), len(segments) - 1)
+        for index, segment in enumerate(segments):
+            next_offset = offset + segment.shape[2]
+            if index < static_prefix_segments:
+                meta = self._segment_meta(segment)
+                next_static_meta.append(meta)
+                if static_meta is not None and index < len(static_meta) and static_meta[index] == meta:
+                    offset = next_offset
+                    continue
+            buffer[:, :, offset:next_offset].copy_(segment)
+            offset = next_offset
+        if static_prefix_segments > 0:
+            self._kv_workspace[f"{workspace_name}_static_meta"] = next_static_meta
+        return buffer
+
+    def _segment_meta(self, segment: torch.Tensor):
+        return (
+            segment.data_ptr(),
+            tuple(segment.shape),
+            tuple(segment.stride()),
+            segment.device,
+            segment.dtype,
         )
 
 
@@ -772,6 +824,7 @@ class DiTBlock(nn.Module):
 
         self.ff_norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.ff = FeedForward(dim=dim, mult=ff_mult, dropout=dropout, approximate="tanh")
+        self._kv_workspace = {}
 
     def forward(self, x, t, mask=None, rope=None):  # x: noised input, t: time embedding
         # pre-norm & modulation for attention input
@@ -815,13 +868,20 @@ class DiTBlock(nn.Module):
         rope=None,
         return_kv=False,
         query_chunk_size=None,
+        history_key=None,
+        history_value=None,
     ):
         norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(x, emb=t)
         query, source_key, source_value = self.attn.project_qkv(norm, rope=rope)
-        prompt_key = prompt_key.to(device=source_key.device, dtype=source_key.dtype)
-        prompt_value = prompt_value.to(device=source_value.device, dtype=source_value.dtype)
-        key = torch.cat([prompt_key, source_key], dim=2)
-        value = torch.cat([prompt_value, source_value], dim=2)
+        key, value = self._compose_prompt_source_kv(
+            prompt_key=prompt_key,
+            prompt_value=prompt_value,
+            source_key=source_key,
+            source_value=source_value,
+            history_key=history_key,
+            history_value=history_value,
+            workspace_prefix="prompt",
+        )
         attn_output = self.attn.attend_projected(query, key, value, mask=mask, query_chunk_size=query_chunk_size)
 
         x = x + gate_msa.unsqueeze(1) * attn_output
@@ -833,6 +893,90 @@ class DiTBlock(nn.Module):
         if return_kv:
             return x, source_key, source_value
         return x
+
+    def _compose_prompt_source_kv(
+        self,
+        *,
+        prompt_key,
+        prompt_value,
+        source_key,
+        source_value,
+        history_key=None,
+        history_value=None,
+        workspace_prefix: str,
+    ):
+        key_segments = [
+            _to_device_dtype_if_needed(prompt_key, device=source_key.device, dtype=source_key.dtype),
+        ]
+        value_segments = [
+            _to_device_dtype_if_needed(prompt_value, device=source_value.device, dtype=source_value.dtype),
+        ]
+        if history_key is not None and history_value is not None:
+            key_segments.append(
+                _to_device_dtype_if_needed(history_key, device=source_key.device, dtype=source_key.dtype),
+            )
+            value_segments.append(
+                _to_device_dtype_if_needed(history_value, device=source_value.device, dtype=source_value.dtype),
+            )
+        key_segments.append(source_key)
+        value_segments.append(source_value)
+        return (
+            self._copy_kv_segments(
+                key_segments,
+                workspace_name=f"{workspace_prefix}_key",
+                static_prefix_segments=1,
+            ),
+            self._copy_kv_segments(
+                value_segments,
+                workspace_name=f"{workspace_prefix}_value",
+                static_prefix_segments=1,
+            ),
+        )
+
+    def _copy_kv_segments(self, segments, workspace_name: str, static_prefix_segments: int = 0):
+        if len(segments) == 1:
+            return segments[0]
+        total_len = sum(segment.shape[2] for segment in segments)
+        if torch.is_grad_enabled():
+            return torch.cat(segments, dim=2)
+        first = segments[0]
+        shape = (first.shape[0], first.shape[1], total_len, first.shape[3])
+        buffer = self._kv_workspace.get(workspace_name)
+        if (
+            buffer is None
+            or buffer.shape != shape
+            or buffer.device != first.device
+            or buffer.dtype != first.dtype
+        ):
+            buffer = torch.empty(shape, device=first.device, dtype=first.dtype)
+            self._kv_workspace[workspace_name] = buffer
+            self._kv_workspace.pop(f"{workspace_name}_static_meta", None)
+        static_meta = self._kv_workspace.get(f"{workspace_name}_static_meta")
+        next_static_meta = []
+        offset = 0
+        static_prefix_segments = min(max(0, int(static_prefix_segments)), len(segments) - 1)
+        for index, segment in enumerate(segments):
+            next_offset = offset + segment.shape[2]
+            if index < static_prefix_segments:
+                meta = self._segment_meta(segment)
+                next_static_meta.append(meta)
+                if static_meta is not None and index < len(static_meta) and static_meta[index] == meta:
+                    offset = next_offset
+                    continue
+            buffer[:, :, offset:next_offset].copy_(segment)
+            offset = next_offset
+        if static_prefix_segments > 0:
+            self._kv_workspace[f"{workspace_name}_static_meta"] = next_static_meta
+        return buffer
+
+    def _segment_meta(self, segment: torch.Tensor):
+        return (
+            segment.data_ptr(),
+            tuple(segment.shape),
+            tuple(segment.stride()),
+            segment.device,
+            segment.dtype,
+        )
 
     def forward_with_grouped_prompt_kv(
         self,
@@ -852,13 +996,32 @@ class DiTBlock(nn.Module):
     ):
         norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(x, emb=t)
         query, current_source_key, current_source_value = self.attn.project_qkv(norm, rope=rope)
-        source_key = current_source_key
-        source_value = current_source_value
         if history_key is not None and history_value is not None:
-            history_key = history_key.to(device=source_key.device, dtype=source_key.dtype)
-            history_value = history_value.to(device=source_value.device, dtype=source_value.dtype)
-            source_key = torch.cat([history_key, source_key], dim=2)
-            source_value = torch.cat([history_value, source_value], dim=2)
+            source_key = self._copy_kv_segments(
+                [
+                    _to_device_dtype_if_needed(
+                        history_key,
+                        device=current_source_key.device,
+                        dtype=current_source_key.dtype,
+                    ),
+                    current_source_key,
+                ],
+                workspace_name="grouped_source_key",
+            )
+            source_value = self._copy_kv_segments(
+                [
+                    _to_device_dtype_if_needed(
+                        history_value,
+                        device=current_source_value.device,
+                        dtype=current_source_value.dtype,
+                    ),
+                    current_source_value,
+                ],
+                workspace_name="grouped_source_value",
+            )
+        else:
+            source_key = current_source_key
+            source_value = current_source_value
         attn_output = self.attn.attend_grouped_prompt_projected(
             query=query,
             source_key=source_key,
@@ -898,13 +1061,32 @@ class DiTBlock(nn.Module):
     ):
         norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(x, emb=t)
         query, current_source_key, current_source_value = self.attn.project_qkv(norm, rope=rope)
-        source_key = current_source_key
-        source_value = current_source_value
         if history_key is not None and history_value is not None:
-            history_key = history_key.to(device=source_key.device, dtype=source_key.dtype)
-            history_value = history_value.to(device=source_value.device, dtype=source_value.dtype)
-            source_key = torch.cat([history_key, source_key], dim=2)
-            source_value = torch.cat([history_value, source_value], dim=2)
+            source_key = self._copy_kv_segments(
+                [
+                    _to_device_dtype_if_needed(
+                        history_key,
+                        device=current_source_key.device,
+                        dtype=current_source_key.dtype,
+                    ),
+                    current_source_key,
+                ],
+                workspace_name="sequential_source_key",
+            )
+            source_value = self._copy_kv_segments(
+                [
+                    _to_device_dtype_if_needed(
+                        history_value,
+                        device=current_source_value.device,
+                        dtype=current_source_value.dtype,
+                    ),
+                    current_source_value,
+                ],
+                workspace_name="sequential_source_value",
+            )
+        else:
+            source_key = current_source_key
+            source_value = current_source_value
 
         attn_output = None
         weights = branch_weights.to(device=query.device, dtype=query.dtype)

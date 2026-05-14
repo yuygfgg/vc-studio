@@ -483,21 +483,11 @@ class DiT(nn.Module):
             return output, None
 
         history_kv = prompt_cache.get("history_kv")
-        if history_kv is None:
-            prompt_kv_iter = zip(self.transformer_blocks, prompt_cache["kv"])
-        else:
-            prompt_kv_iter = (
-                (
-                    block,
-                    (
-                        torch.cat([base_key.to(device=hist_key.device, dtype=hist_key.dtype), hist_key], dim=2),
-                        torch.cat([base_value.to(device=hist_value.device, dtype=hist_value.dtype), hist_value], dim=2),
-                    ),
-                )
-                for block, (base_key, base_value), (hist_key, hist_value) in zip(self.transformer_blocks, prompt_cache["kv"], history_kv)
-            )
+        prompt_kv_iter = zip(self.transformer_blocks, prompt_cache["kv"])
 
-        for block, (prompt_key, prompt_value) in prompt_kv_iter:
+        for block_index, (block, (prompt_key, prompt_value)) in enumerate(prompt_kv_iter):
+            history_pair = history_kv[block_index] if history_kv is not None else None
+            history_key, history_value = history_pair if history_pair is not None else (None, None)
             if return_source_cache:
                 x, source_key, source_value = block.forward_with_prompt_kv(
                     x,
@@ -508,6 +498,8 @@ class DiT(nn.Module):
                     rope=rope,
                     return_kv=True,
                     query_chunk_size=source_query_chunk_size,
+                    history_key=history_key,
+                    history_value=history_value,
                 )
                 source_cache.append((source_key, source_value))
             else:
@@ -519,6 +511,8 @@ class DiT(nn.Module):
                     mask=attn_mask.bool(),
                     rope=rope,
                     query_chunk_size=source_query_chunk_size,
+                    history_key=history_key,
+                    history_value=history_value,
                 )
 
         x = self.norm_out(x, t)
